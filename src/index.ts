@@ -12,11 +12,38 @@
  * Routes:
  *   /                          - Station index (placeholder)
  *   /pws/<stationId>           - Redirects to /pws/<stationId>/dashboard
- *   /pws/<stationId>/<question>- Per-station pages (questions: dashboard, rain-yesterday)
+ *   /pws/<stationId>/dashboard            - Per-station dashboard
+ *   /pws/<stationId>/rain[/<spec>]        - Rainfall page; spec ∈ today (default) | yesterday | YYYY-MM-DD
  *
  * Optional KV namespace: WEATHER. Used as a cache when the historical API is
  * temporarily unavailable.
  */
+
+import neighborsData from '../data/neighbors.json';
+
+interface NeighborEntry {
+	stationId: string;
+	name: string | null;
+	lat: number | null;
+	lon: number | null;
+	distanceKm: number | null;
+	distanceMi: number | null;
+	qcStatus: number | null;
+	updateTimeUtc: number | null;
+}
+interface NeighborsFile {
+	generatedAt: string;
+	stations: Record<string, { lat: number; lon: number; neighborhood: string | null; neighbors: NeighborEntry[] }>;
+}
+const NEIGHBORS: NeighborsFile = neighborsData as NeighborsFile;
+
+interface NeighborRainReading {
+	stationId: string;
+	name: string | null;
+	distanceMi: number | null;
+	rainfall: number | null;
+	error: string | null;
+}
 
 interface UnitValues {
 	precipTotal?: number;
@@ -143,7 +170,6 @@ interface BackfillState {
 
 interface DashboardData {
 	stationId: string;
-	yesterday: DailyWeather | null;
 	today: DailyWeather | null;
 	recentDays: DailyWeather[];
 	hourly7Day: WUHistoryObservation[];
@@ -196,6 +222,36 @@ export default {
 			return Response.redirect(`${url.origin}/pws/${pwsBareMatch[1]}/dashboard`, 302);
 		}
 
+		// /pws/<id>/rain[/<spec>]   spec defaults to today; can be 'today', 'yesterday', or YYYY-MM-DD
+		const pwsRainMatch = /^\/pws\/([^/]+)\/rain(?:\/([^/]+))?\/?$/.exec(url.pathname);
+		if (pwsRainMatch) {
+			const stationId = decodeURIComponent(pwsRainMatch[1]);
+			const spec = pwsRainMatch[2] ? decodeURIComponent(pwsRainMatch[2]) : 'today';
+			if (!isValidStation(env, stationId)) {
+				return new Response('Station not found.', { status: 404 });
+			}
+			const { WU_API_KEY } = weatherConfig(env);
+			if (!WU_API_KEY) {
+				return new Response('Missing WU_API_KEY configuration.', { status: 500 });
+			}
+			try {
+				const dashboard = await buildDashboard(env, stationId);
+				const target = resolveRainTarget(dashboard, spec);
+				if ('error' in target) {
+					return new Response(target.error, { status: 400 });
+				}
+				const rainfall = await loadRainfallForDate(env, stationId, dashboard, target.date, target.isToday);
+				const neighborRain = await fetchNeighborRainfallForDate(env, stationId, target.date);
+				return new Response(renderRainPage(dashboard, target, rainfall, neighborRain), {
+					headers: { 'Content-Type': 'text/html; charset=utf-8' },
+				});
+			} catch (err: unknown) {
+				const msg = err instanceof Error ? err.message : String(err);
+				console.error(`PWS rain page error (${spec}):`, msg);
+				return new Response(`Error: ${msg}`, { status: 500 });
+			}
+		}
+
 		// /pws/<id>/<question>
 		const pwsQMatch = /^\/pws\/([^/]+)\/([^/]+)$/.exec(url.pathname);
 		if (pwsQMatch) {
@@ -212,11 +268,6 @@ export default {
 				const dashboard = await buildDashboard(env, stationId);
 				if (question === 'dashboard') {
 					return new Response(renderDashboard(dashboard, isLocalHost(url.hostname)), {
-						headers: { 'Content-Type': 'text/html; charset=utf-8' },
-					});
-				}
-				if (question === 'rain-yesterday') {
-					return new Response(renderYesterdayRain(dashboard), {
 						headers: { 'Content-Type': 'text/html; charset=utf-8' },
 					});
 				}
@@ -316,14 +367,12 @@ async function buildDashboard(env: Env, stationId: string): Promise<DashboardDat
 	const latestSummaryDate = recentDays[recentDays.length - 1]?.date ?? null;
 	const todayDate = currentLocalDate ?? latestSummaryDate;
 	const today = todayDate ? findDay(recentDays, todayDate) : null;
-	const yesterday = todayDate ? findPreviousDay(recentDays, todayDate) : recentDays.at(-2) ?? null;
 	const lastReading = current?.obsTimeLocal ?? current?.obsTimeUtc ?? recentDays.at(-1)?.obsTimeLocal ?? 'N/A';
 	const { last: lastScheduledRun, next: nextScheduledRun } = getCron15Times();
 	console.log('[dashboard] nextScheduledRun:', nextScheduledRun);
 
 	return {
 		stationId,
-		yesterday,
 		today: mergeTodayWithCurrent(today, current, todayDate),
 		recentDays,
 		historyIndex,
@@ -362,6 +411,38 @@ async function fetchDailySummaries(env: Env, stationId: string): Promise<DailyWe
 		.map((summary) => normalizeDailySummary(summary, 'historical'))
 		.filter((day): day is DailyWeather => day !== null)
 		.sort((a, b) => a.date.localeCompare(b.date));
+}
+
+async function fetchNeighborRainfallForDate(
+	env: Env,
+	primaryId: string,
+	date: string,
+): Promise<NeighborRainReading[]> {
+	const entry = NEIGHBORS.stations[primaryId];
+	if (!entry || entry.neighbors.length === 0) return [];
+	return Promise.all(
+		entry.neighbors.map(async (n): Promise<NeighborRainReading> => {
+			try {
+				const days = await fetchDailySummaries(env, n.stationId);
+				const match = days.find((d) => d.date === date);
+				return {
+					stationId: n.stationId,
+					name: n.name,
+					distanceMi: n.distanceMi,
+					rainfall: match?.rainfall ?? null,
+					error: match ? null : 'no matching day',
+				};
+			} catch (err: unknown) {
+				return {
+					stationId: n.stationId,
+					name: n.name,
+					distanceMi: n.distanceMi,
+					rainfall: null,
+					error: err instanceof Error ? err.message : String(err),
+				};
+			}
+		}),
+	);
 }
 
 async function fetchHistoryHourlyRawRange(
@@ -463,6 +544,20 @@ function getDefaultStation(env: Env): string | undefined {
 
 function isValidStation(env: Env, stationId: string): boolean {
 	return getStationIds(env).includes(stationId);
+}
+
+function isKnownNeighbor(stationId: string): boolean {
+	for (const entry of Object.values(NEIGHBORS.stations)) {
+		if (entry.neighbors.some((n) => n.stationId === stationId)) return true;
+	}
+	return false;
+}
+
+type StationRole = 'primary' | 'neighbor' | 'unknown';
+function getStationRole(env: Env, stationId: string): StationRole {
+	if (isValidStation(env, stationId)) return 'primary';
+	if (isKnownNeighbor(stationId)) return 'neighbor';
+	return 'unknown';
 }
 
 interface StationCoords {
@@ -998,9 +1093,38 @@ function findDay(days: DailyWeather[], date: string): DailyWeather | null {
 	return days.find((day) => day.date === date) ?? null;
 }
 
-function findPreviousDay(days: DailyWeather[], date: string): DailyWeather | null {
-	const earlier = days.filter((day) => day.date < date);
-	return earlier.at(-1) ?? null;
+interface RainTarget {
+	date: string;
+	isToday: boolean;
+	isYesterday: boolean;
+}
+
+function resolveRainTarget(dashboard: DashboardData, spec: string): RainTarget | { error: string } {
+	const todayDate = dashboard.today?.date ?? new Date().toISOString().slice(0, 10);
+	const yesterdayDate = ymdToIsoDate(dateToYmd(addUtcDays(isoDateToDate(todayDate), -1)));
+	const lower = spec.toLowerCase();
+	let date: string;
+	if (lower === 'today') date = todayDate;
+	else if (lower === 'yesterday') date = yesterdayDate;
+	else if (isIsoDate(spec)) date = spec;
+	else return { error: `Invalid date '${spec}'. Use YYYY-MM-DD, 'today', or 'yesterday'.` };
+	return { date, isToday: date === todayDate, isYesterday: date === yesterdayDate };
+}
+
+async function loadRainfallForDate(
+	env: Env,
+	stationId: string,
+	dashboard: DashboardData,
+	date: string,
+	isToday: boolean,
+): Promise<number | null> {
+	if (isToday && dashboard.today) {
+		return dashboard.today.rainfall;
+	}
+	const recent = dashboard.recentDays.find((d) => d.date === date);
+	if (recent) return recent.rainfall;
+	const days = await loadHistoryDailyRange(env, stationId, date, date);
+	return days.find((d) => d.date === date)?.rainfall ?? null;
 }
 
 function localDate(obsTimeLocal: string): string {
@@ -2045,18 +2169,65 @@ function fmtPrettyDate(ymd: string): string {
 	});
 }
 
-function renderYesterdayRain(d: DashboardData): string {
-	const yesterday = d.yesterday;
-	const prettyDate = yesterday?.date ? fmtPrettyDate(yesterday.date) : 'unknown date';
-	const rainfall = yesterday?.rainfall ?? null;
+function renderRainPage(
+	d: DashboardData,
+	target: RainTarget,
+	rainfall: number | null,
+	neighborRain: NeighborRainReading[] = [],
+): string {
+	const prettyDate = fmtPrettyDate(target.date);
 	const tz = d.timezone ?? 'local time';
+	const heading = target.isToday
+		? 'How much has it rained today?'
+		: target.isYesterday
+			? 'How much did it rain yesterday?'
+			: `How much did it rain on ${prettyDate}?`;
+	const dateLine = target.isToday
+		? `${prettyDate} (so far) at ${d.stationId}`
+		: `${prettyDate} at ${d.stationId}`;
+	const titleVerb = target.isToday ? "Today's" : target.isYesterday ? "Yesterday's" : prettyDate;
+
+	const all: Array<{ id: string; name: string | null; distanceMi: number | null; rainfall: number; isPrimary: boolean }> = [];
+	if (rainfall !== null) {
+		all.push({ id: d.stationId, name: null, distanceMi: 0, rainfall, isPrimary: true });
+	}
+	for (const n of neighborRain) {
+		if (n.rainfall !== null) {
+			all.push({ id: n.stationId, name: n.name, distanceMi: n.distanceMi, rainfall: n.rainfall, isPrimary: false });
+		}
+	}
+	const sorted = [...all].sort((a, b) => b.rainfall - a.rainfall);
+	const primaryRank = rainfall !== null ? sorted.findIndex((s) => s.isPrimary) + 1 : 0;
+	const others = sorted.filter((s) => !s.isPrimary).map((s) => s.rainfall);
+	const median = others.length > 0 ? others.slice().sort((a, b) => a - b)[Math.floor(others.length / 2)] : null;
+
+	const tableRows = [...all]
+		.sort((a, b) => (a.distanceMi ?? 0) - (b.distanceMi ?? 0))
+		.map((s) => {
+			const cls = s.isPrimary ? ' class="you"' : '';
+			const dist = s.isPrimary ? 'you' : s.distanceMi !== null ? `${s.distanceMi.toFixed(2)} mi` : '—';
+			return `<tr${cls}><td>${escHtml(dist)}</td><td>${escHtml(s.id)}</td><td>${escHtml(s.rainfall.toFixed(2))}"</td></tr>`;
+		})
+		.join('');
+
+	const comparisonBlock = all.length > 1
+		? `<section class="compare">
+    <div class="compare-summary">
+      You ranked <strong>${primaryRank}</strong> of <strong>${sorted.length}</strong>${median !== null ? ` · neighborhood median <strong>${escHtml(median.toFixed(2))}"</strong>` : ''}
+    </div>
+    <table class="compare-table">
+      <thead><tr><th>Distance</th><th>Station</th><th>Rain</th></tr></thead>
+      <tbody>${tableRows}</tbody>
+    </table>
+  </section>`
+		: '';
 
 	return `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>Yesterday's Rain at ${escHtml(d.stationId)}</title>
+<title>${escHtml(titleVerb)} Rain at ${escHtml(d.stationId)}</title>
 <style>
   *, *::before, *::after { box-sizing: border-box; }
   body {
@@ -2095,17 +2266,25 @@ function renderYesterdayRain(d: DashboardData): string {
   .meta a { color: #0e7fcf; text-decoration: none; }
   .meta a:hover { text-decoration: underline; }
   .warning { color: #7a5a00; }
+  .compare { margin-top: 40px; text-align: left; }
+  .compare-summary { color: #1a1f2c; font-size: 1rem; margin-bottom: 12px; text-align: center; }
+  .compare-table { width: 100%; border-collapse: collapse; font-size: .95rem; }
+  .compare-table th, .compare-table td { padding: 6px 10px; border-bottom: 1px solid #e3e8ef; text-align: left; }
+  .compare-table th { color: #5a6878; font-weight: 500; font-size: .85rem; text-transform: uppercase; letter-spacing: .04em; }
+  .compare-table tr.you { background: #e8f3fc; font-weight: 600; }
+  .compare-table td:last-child, .compare-table th:last-child { text-align: right; }
   @media (max-width: 500px) { body { padding: 16px; } }
 </style>
 </head>
 <body>
 <main>
-  <h1>How much did it rain yesterday?</h1>
-  <div class="date">${escHtml(prettyDate)} at ${escHtml(d.stationId)}</div>
+  <h1>${escHtml(heading)}</h1>
+  <div class="date">${escHtml(dateLine)}</div>
   ${rainfall !== null
 		? `<div class="answer">${escHtml(rainfall.toFixed(2))}"</div><div class="unit">inches</div>`
 		: `<div class="none">No data available</div>`
   }
+  ${comparisonBlock}
   <div class="meta">
     Timezone: ${escHtml(tz)}<br>
     Source: ${escHtml(d.dataSource)}${d.warning ? `<br><span class="warning">${escHtml(d.warning)}</span>` : ''}<br>

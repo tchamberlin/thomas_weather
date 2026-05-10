@@ -15,8 +15,8 @@ const execAsync = promisify(exec);
  * Add new entries here as the app grows more pages.
  */
 const QUESTIONS = [
-  { slug: 'dashboard', title: 'Full Weather Dashboard' },
-  { slug: 'rain-yesterday', title: 'How much rain did we get yesterday?' },
+  { path: 'dashboard', slug: 'dashboard', title: 'Full Weather Dashboard' },
+  { path: 'rain/yesterday', slug: 'rain-yesterday', title: 'How much rain did we get yesterday?' },
 ];
 
 async function buildRoutes() {
@@ -30,7 +30,7 @@ async function buildRoutes() {
   for (const stationId of stationIds) {
     for (const q of QUESTIONS) {
       routes.push({
-        path: `/pws/${encodeURIComponent(stationId)}/${q.slug}`,
+        path: `/pws/${encodeURIComponent(stationId)}/${q.path}`,
         title: `${q.title} — ${stationId}`,
         slug: `${stationId}-${q.slug}`,
       });
