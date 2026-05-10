@@ -6,7 +6,7 @@ import process from 'node:process';
 import { spawn } from 'node:child_process';
 
 const args = parseArgs(process.argv.slice(2));
-const stationId = args.station ?? process.env.WU_STATION_ID ?? (await readDevVars(args.env ?? '.dev.vars')).WU_STATION_ID;
+const stationId = args.station;
 const endpoint = args.endpoint ?? 'hourly';
 const inDir = args.in ?? 'data/wunderground';
 const binding = args.binding ?? 'WEATHER';
@@ -21,7 +21,7 @@ if (args.help) {
 	process.exit(0);
 }
 
-if (!stationId) fail('Missing station. Pass --station or set WU_STATION_ID/.dev.vars.');
+if (!stationId) fail('Missing --station. Pass --station <stationId>.');
 if (endpoint !== 'hourly') fail('Only --endpoint hourly is supported for raw KV history upload right now.');
 if (mode === 'remote' && !args.yes) fail('Remote upload requires --yes.');
 
@@ -267,7 +267,7 @@ function printHelp() {
 Uploads local raw hourly history blocks into Workers KV.
 
 Options:
-  --station KVALAKEF29   Default: WU_STATION_ID from env/.dev.vars.
+  --station KVALAKEF29   PWS station ID (required).
   --in DIR               Default: data/wunderground.
   --binding WEATHER     KV binding name. Default: WEATHER.
   --local                Upload to local Wrangler KV storage. Default.

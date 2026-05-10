@@ -9,7 +9,7 @@ declare namespace Cloudflare {
 		WEATHER: KVNamespace;
 		ASSETS: Fetcher;
 		WU_API_KEY: string;
-		WU_STATION_ID: string;
+		WU_STATION_IDS: string;
 		BACKFILL_TOKEN: string;
 	}
 }
@@ -18,7 +18,7 @@ type StringifyValues<EnvType extends Record<string, unknown>> = {
 	[Binding in keyof EnvType]: EnvType[Binding] extends string ? EnvType[Binding] : string;
 };
 declare namespace NodeJS {
-	interface ProcessEnv extends StringifyValues<Pick<Cloudflare.Env, "WU_API_KEY" | "WU_STATION_ID" | "BACKFILL_TOKEN">> {}
+	interface ProcessEnv extends StringifyValues<Pick<Cloudflare.Env, "WU_API_KEY" | "WU_STATION_IDS" | "BACKFILL_TOKEN">> {}
 }
 
 // Begin runtime types

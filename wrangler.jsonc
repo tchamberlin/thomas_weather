@@ -34,7 +34,7 @@
 	/**
    * Secrets (set via `npx wrangler secret put <NAME>`):
    *   WU_API_KEY       — Weather Underground API key
-   *   WU_STATION_ID    — PWS station ID
+	   *   WU_STATION_IDS   — Comma-separated PWS station IDs
    *   BACKFILL_TOKEN   — bearer/query token for admin history backfill endpoints
    */
 }

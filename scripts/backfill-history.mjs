@@ -10,7 +10,7 @@ const MAX_RANGE_DAYS = 31;
 const args = parseArgs(process.argv.slice(2));
 const dotEnv = await readDevVars(args.env ?? '.dev.vars');
 const apiKey = cleanSecret(args.apiKey ?? process.env.WU_API_KEY ?? dotEnv.WU_API_KEY);
-const stationId = cleanSecret(args.station ?? process.env.WU_STATION_ID ?? dotEnv.WU_STATION_ID);
+const stationId = cleanSecret(args.station);
 const endpoint = args.endpoint ?? 'hourly';
 const outDir = args.out ?? 'data/wunderground';
 const units = args.units ?? 'e';
@@ -26,8 +26,11 @@ if (args.help) {
 	process.exit(0);
 }
 
-if (!apiKey || !stationId) {
-	fail('Missing WU_API_KEY or WU_STATION_ID. Set env vars or .dev.vars.');
+if (!apiKey) {
+	fail('Missing WU_API_KEY. Set env var or .dev.vars.');
+}
+if (!stationId) {
+	fail('Missing --station. Pass --station <stationId>.');
 }
 
 if (!['hourly', 'daily'].includes(endpoint)) {
@@ -273,7 +276,7 @@ Options:
   --start YYYYMMDD       Start date. If provided, runs forward to --end.
   --end YYYYMMDD         End date. Default: yesterday UTC.
   --endpoint hourly|daily
-  --station KVALAKEF29   Default: WU_STATION_ID from env/.dev.vars.
+  --station KVALAKEF29   PWS station ID (required).
   --out DIR              Default: data/wunderground.
   --max-blocks N         Limit number of 31-day requests for testing.
   --empty-stop N         Backward mode stops after N empty blocks. Default: 2.

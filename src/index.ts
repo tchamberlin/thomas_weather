@@ -7,7 +7,12 @@
  *
  * Config via secrets (set with `npx wrangler secret put <NAME>`):
  *   WU_API_KEY      - Weather Underground API key
- *   WU_STATION_ID   - Your PWS station ID (e.g. "KVALAKEF29")
+ *   WU_STATION_IDS  - Comma-separated PWS station IDs (e.g. "KVALAKEF29,KFOO")
+ *
+ * Routes:
+ *   /                          - Station index (placeholder)
+ *   /pws/<stationId>           - Redirects to /pws/<stationId>/dashboard
+ *   /pws/<stationId>/<question>- Per-station pages (questions: dashboard, rain-yesterday)
  *
  * Optional KV namespace: WEATHER. Used as a cache when the historical API is
  * temporarily unavailable.
@@ -157,62 +162,89 @@ const HISTORY_BLOCK_DAYS = 31;
 export default {
 	async scheduled(_event: ScheduledController, env: Env, _ctx: ExecutionContext): Promise<void> {
 		console.log('[cron] scheduled run started');
-		await refreshDailySummaryCache(env);
-		await refreshRecentHistory(env);
+		const stationIds = getStationIds(env);
+		for (const stationId of stationIds) {
+			await refreshDailySummaryCache(env, stationId);
+			await refreshRecentHistory(env, stationId);
+		}
 		console.log('[cron] scheduled run completed');
 	},
 
 	async fetch(req: Request, env: Env): Promise<Response> {
 		const url = new URL(req.url);
-			if (url.pathname === '/__live-reload') {
-				return liveReloadStream();
-			}
-			if (url.pathname.startsWith('/vendor/')) {
-				return env.ASSETS.fetch(req);
-			}
-			if (url.pathname === '/api/history/daily') {
-				return handleHistoryDaily(req, env);
-			}
-			if (url.pathname === '/admin/backfill/hourly') {
-				return handleHourlyBackfill(req, env);
-			}
-		if (url.pathname === '/admin/history/status') {
-			const auth = authorizeAdmin(req, env);
-			if (auth) return auth;
-			return jsonResponse({ index: await readHistoryIndex(env), backfill: await readBackfillState(env) });
+
+		if (url.pathname === '/__live-reload') {
+			return liveReloadStream();
+		}
+		if (url.pathname.startsWith('/vendor/')) {
+			return env.ASSETS.fetch(req);
 		}
 
-		const { WU_API_KEY, WU_STATION_ID } = weatherConfig(env);
-		if (!WU_API_KEY || !WU_STATION_ID) {
-			return new Response(
-				'Missing configuration. Set WU_API_KEY and WU_STATION_ID via `npx wrangler secret put <NAME>`.',
-				{ status: 500 },
-			);
+		// New home page (placeholder)
+		if (url.pathname === '/') {
+			const stationIds = getStationIds(env);
+			return new Response(renderHomePage(stationIds), {
+				headers: { 'Content-Type': 'text/html; charset=utf-8' },
+			});
 		}
 
-		if (url.pathname === '/rain-yesterday') {
+		// /pws/<id> -> /pws/<id>/dashboard
+		const pwsBareMatch = /^\/pws\/([^/]+)\/?$/.exec(url.pathname);
+		if (pwsBareMatch) {
+			return Response.redirect(`${url.origin}/pws/${pwsBareMatch[1]}/dashboard`, 302);
+		}
+
+		// /pws/<id>/<question>
+		const pwsQMatch = /^\/pws\/([^/]+)\/([^/]+)$/.exec(url.pathname);
+		if (pwsQMatch) {
+			const stationId = decodeURIComponent(pwsQMatch[1]);
+			const question = pwsQMatch[2];
+			if (!isValidStation(env, stationId)) {
+				return new Response('Station not found.', { status: 404 });
+			}
+			const { WU_API_KEY } = weatherConfig(env);
+			if (!WU_API_KEY) {
+				return new Response('Missing WU_API_KEY configuration.', { status: 500 });
+			}
 			try {
-				const dashboard = await buildDashboard(env);
-				return new Response(renderYesterdayRain(dashboard), {
-					headers: { 'Content-Type': 'text/html; charset=utf-8' },
-				});
+				const dashboard = await buildDashboard(env, stationId);
+				if (question === 'dashboard') {
+					return new Response(renderDashboard(dashboard, isLocalHost(url.hostname)), {
+						headers: { 'Content-Type': 'text/html; charset=utf-8' },
+					});
+				}
+				if (question === 'rain-yesterday') {
+					return new Response(renderYesterdayRain(dashboard), {
+						headers: { 'Content-Type': 'text/html; charset=utf-8' },
+					});
+				}
+				return new Response('Unknown question.', { status: 404 });
 			} catch (err: unknown) {
 				const msg = err instanceof Error ? err.message : String(err);
-				console.error('Yesterday rain page error:', msg);
+				console.error(`PWS page error (${question}):`, msg);
 				return new Response(`Error: ${msg}`, { status: 500 });
 			}
 		}
 
-		try {
-			const dashboard = await buildDashboard(env);
-			return new Response(renderDashboard(dashboard, isLocalHost(url.hostname)), {
-				headers: { 'Content-Type': 'text/html; charset=utf-8' },
-			});
-		} catch (err: unknown) {
-			const msg = err instanceof Error ? err.message : String(err);
-			console.error('Dashboard error:', msg);
-			return new Response(`Error: ${msg}`, { status: 500 });
+		// API routes
+		if (url.pathname === '/api/history/daily') {
+			return handleHistoryDaily(req, env);
 		}
+		if (url.pathname === '/admin/backfill/hourly') {
+			return handleHourlyBackfill(req, env);
+		}
+		if (url.pathname === '/admin/history/status') {
+			const auth = authorizeAdmin(req, env);
+			if (auth) return auth;
+			const urlObj = new URL(req.url);
+			const stationId = urlObj.searchParams.get('stationId') ?? getDefaultStation(env);
+			if (!stationId) {
+				return jsonResponse({ error: 'Missing stationId query parameter.' }, 400);
+			}
+			return jsonResponse({ index: await readHistoryIndex(env, stationId), backfill: await readBackfillState(env, stationId) });
+		}
+
+		return new Response('Not found.', { status: 404 });
 	},
 } satisfies ExportedHandler<Env>;
 
@@ -262,13 +294,13 @@ function getCron15Times(now: Date = new Date()): { last: string; next: string } 
 	return result;
 }
 
-async function buildDashboard(env: Env): Promise<DashboardData> {
+async function buildDashboard(env: Env, stationId: string): Promise<DashboardData> {
 	console.log('[dashboard] buildDashboard started');
 	const [dailyResult, currentResult, historyIndex, hourly7Day] = await Promise.all([
-		loadDailySummaries(env),
-		loadCurrent(env),
-		readHistoryIndex(env),
-		fetchHourly7Day(env),
+		loadDailySummaries(env, stationId),
+		loadCurrent(env, stationId),
+		readHistoryIndex(env, stationId),
+		fetchHourly7Day(env, stationId),
 	]);
 	const current = currentResult.current;
 	const recentDays = dailyResult.days;
@@ -282,7 +314,7 @@ async function buildDashboard(env: Env): Promise<DashboardData> {
 	console.log('[dashboard] nextScheduledRun:', nextScheduledRun);
 
 	return {
-		stationId: env.WU_STATION_ID,
+		stationId,
 		yesterday,
 		today: mergeTodayWithCurrent(today, current, todayDate),
 		recentDays,
@@ -298,24 +330,24 @@ async function buildDashboard(env: Env): Promise<DashboardData> {
 	};
 }
 
-async function loadCurrent(env: Env): Promise<{ current: WUCurrentObservation | null; warning: string | null }> {
+async function loadCurrent(env: Env, stationId: string): Promise<{ current: WUCurrentObservation | null; warning: string | null }> {
 	try {
-		return { current: await fetchCurrent(env), warning: null };
+		return { current: await fetchCurrent(env, stationId), warning: null };
 	} catch (err: unknown) {
 		const msg = err instanceof Error ? err.message : String(err);
 		return { current: null, warning: `Current conditions unavailable. ${msg}` };
 	}
 }
 
-async function fetchCurrent(env: Env): Promise<WUCurrentObservation | null> {
-	const body = await fetchJson<WUCurrentResponse>(env, '/v2/pws/observations/current', {
+async function fetchCurrent(env: Env, stationId: string): Promise<WUCurrentObservation | null> {
+	const body = await fetchJson<WUCurrentResponse>(env, stationId, '/v2/pws/observations/current', {
 		numericPrecision: false,
 	});
 	return body.observations?.[0] ?? null;
 }
 
-async function fetchDailySummaries(env: Env): Promise<DailyWeather[]> {
-	const body = await fetchJson<WUDailySummaryResponse>(env, '/v2/pws/dailysummary/7day', {
+async function fetchDailySummaries(env: Env, stationId: string): Promise<DailyWeather[]> {
+	const body = await fetchJson<WUDailySummaryResponse>(env, stationId, '/v2/pws/dailysummary/7day', {
 		numericPrecision: true,
 	});
 	return (body.summaries ?? [])
@@ -326,10 +358,11 @@ async function fetchDailySummaries(env: Env): Promise<DailyWeather[]> {
 
 async function fetchHistoryHourlyRawRange(
 	env: Env,
+	stationId: string,
 	startDate: string,
 	endDate: string,
 ): Promise<{ text: string; records: number }> {
-	const text = await fetchRaw(env, '/v2/pws/history/hourly', {
+	const text = await fetchRaw(env, stationId, '/v2/pws/history/hourly', {
 		numericPrecision: true,
 		params: { startDate, endDate },
 	});
@@ -345,12 +378,13 @@ async function fetchHistoryHourlyRawRange(
 
 async function fetchJson<T>(
 	env: Env,
+	stationId: string,
 	path: string,
 	options: { numericPrecision: boolean; params?: Record<string, string> },
 ): Promise<T> {
-	const { WU_API_KEY, WU_STATION_ID } = weatherConfig(env);
+	const { WU_API_KEY } = weatherConfig(env);
 	const url = new URL(`https://api.weather.com${path}`);
-	url.searchParams.set('stationId', WU_STATION_ID);
+	url.searchParams.set('stationId', stationId);
 	url.searchParams.set('format', 'json');
 	url.searchParams.set('units', 'e');
 	if (options.numericPrecision) {
@@ -376,12 +410,13 @@ async function fetchJson<T>(
 
 async function fetchRaw(
 	env: Env,
+	stationId: string,
 	path: string,
 	options: { numericPrecision: boolean; params?: Record<string, string> },
 ): Promise<string> {
-	const { WU_API_KEY, WU_STATION_ID } = weatherConfig(env);
+	const { WU_API_KEY } = weatherConfig(env);
 	const url = new URL(`https://api.weather.com${path}`);
-	url.searchParams.set('stationId', WU_STATION_ID);
+	url.searchParams.set('stationId', stationId);
 	url.searchParams.set('format', 'json');
 	url.searchParams.set('units', 'e');
 	if (options.numericPrecision) {
@@ -405,12 +440,23 @@ async function fetchRaw(
 	return body;
 }
 
-function weatherConfig(env: Env): { WU_API_KEY: string; WU_STATION_ID: string } {
+function weatherConfig(env: Env): { WU_API_KEY: string } {
 	return {
 		WU_API_KEY: cleanSecret(env.WU_API_KEY),
-		WU_STATION_ID: cleanSecret(env.WU_STATION_ID),
 	};
 }
+function getStationIds(env: Env): string[] {
+	return cleanSecret(env.WU_STATION_IDS).split(',').map((s) => s.trim()).filter(Boolean);
+}
+
+function getDefaultStation(env: Env): string | undefined {
+	return getStationIds(env)[0];
+}
+
+function isValidStation(env: Env, stationId: string): boolean {
+	return getStationIds(env).includes(stationId);
+}
+
 
 function cleanSecret(value: string | undefined): string {
 	if (!value) return '';
@@ -429,11 +475,15 @@ function joinWarnings(...warnings: Array<string | null>): string | null {
 	return active.length > 0 ? active.join(' ') : null;
 }
 
-async function handleHourlyBackfill(req: Request, env: Env): Promise<Response> {
+async function handleHourlyBackfill(req: Request, env: Env, fallbackStationId?: string): Promise<Response> {
 	const auth = authorizeAdmin(req, env);
 	if (auth) return auth;
 
 	const url = new URL(req.url);
+	const stationId = url.searchParams.get('stationId') ?? fallbackStationId ?? getDefaultStation(env);
+	if (!stationId) {
+		return jsonResponse({ error: 'Missing stationId. Pass ?stationId=ID or configure a default station.' }, 400);
+	}
 	const today = new Date();
 	const defaultEnd = dateToYmd(addUtcDays(today, -1));
 	const requestedStart = url.searchParams.get('start');
@@ -444,13 +494,13 @@ async function handleHourlyBackfill(req: Request, env: Env): Promise<Response> {
 		return jsonResponse({ error: 'Invalid end date. Use YYYYMMDD.' }, 400);
 	}
 
-	let state = reset ? null : await readBackfillState(env);
+	let state = reset ? null : await readBackfillState(env, stationId);
 	if (!state || requestedStart) {
 		if (!requestedStart || !isYmd(requestedStart)) {
 			return jsonResponse({ error: 'Missing or invalid start date. Use /admin/backfill/hourly?start=YYYYMMDD.' }, 400);
 		}
 		state = {
-			stationId: weatherConfig(env).WU_STATION_ID,
+			stationId: stationId,
 			startDate: requestedStart,
 			endDate: requestedEnd,
 			cursorDate: requestedStart,
@@ -464,14 +514,14 @@ async function handleHourlyBackfill(req: Request, env: Env): Promise<Response> {
 	if (state.done || state.cursorDate > state.endDate) {
 		state = { ...state, done: true, updatedAt: new Date().toISOString() };
 		await writeBackfillState(env, state);
-		return jsonResponse({ status: 'done', state, index: await readHistoryIndex(env) });
+		return jsonResponse({ status: 'done', state, index: await readHistoryIndex(env, stationId) });
 	}
 
 	const blockStart = state.cursorDate;
 	const blockEnd = minYmd(dateToYmd(addUtcDays(ymdToDate(blockStart), HISTORY_BLOCK_DAYS - 1)), state.endDate);
-	const raw = await fetchHistoryHourlyRawRange(env, blockStart, blockEnd);
-	const kvKey = historyBlockKey(weatherConfig(env).WU_STATION_ID, blockStart, blockEnd);
-	await writeHistoryBlock(env, kvKey, raw.text, blockStart, blockEnd, raw.records);
+	const raw = await fetchHistoryHourlyRawRange(env, stationId, blockStart, blockEnd);
+	const kvKey = historyBlockKey(stationId, blockStart, blockEnd);
+	await writeHistoryBlock(env, stationId, kvKey, raw.text, blockStart, blockEnd, raw.records);
 
 	const nextCursor = dateToYmd(addUtcDays(ymdToDate(blockEnd), 1));
 	const done = nextCursor > state.endDate;
@@ -493,9 +543,9 @@ async function handleHourlyBackfill(req: Request, env: Env): Promise<Response> {
 
 	return jsonResponse({
 		status: done ? 'done' : 'ok',
-		nextUrl: done ? null : `/admin/backfill/hourly`,
+		nextUrl: done ? null : `/admin/backfill/hourly?stationId=${encodeURIComponent(stationId)}`,
 		state: nextState,
-		index: await readHistoryIndex(env),
+		index: await readHistoryIndex(env, stationId),
 	});
 }
 
@@ -512,25 +562,23 @@ function authorizeAdmin(req: Request, env: Env): Response | null {
 	return null;
 }
 
-async function refreshDailySummaryCache(env: Env): Promise<void> {
-	const days = await fetchDailySummaries(env);
-	await cacheDailySummaries(env, days);
+async function refreshDailySummaryCache(env: Env, stationId: string): Promise<void> {
+	const days = await fetchDailySummaries(env, stationId);
+	await cacheDailySummaries(env, stationId, days);
 }
 
-async function refreshRecentHistory(env: Env): Promise<void> {
+async function refreshRecentHistory(env: Env, stationId: string): Promise<void> {
 	const end = dateToYmd(addUtcDays(new Date(), -1));
 	const start = dateToYmd(addUtcDays(ymdToDate(end), -HISTORY_BLOCK_DAYS + 1));
-	const raw = await fetchHistoryHourlyRawRange(env, start, end);
-	const stationId = weatherConfig(env).WU_STATION_ID;
-	await writeHistoryBlock(env, historyBlockKey(stationId, start, end), raw.text, start, end, raw.records);
+	const raw = await fetchHistoryHourlyRawRange(env, stationId, start, end);
+	await writeHistoryBlock(env, stationId, historyBlockKey(stationId, start, end), raw.text, start, end, raw.records);
 }
 
-async function fetchHourly7Day(env: Env): Promise<WUHistoryObservation[]> {
+async function fetchHourly7Day(env: Env, stationId: string): Promise<WUHistoryObservation[]> {
 	const today = dateToYmd(new Date());
 	const start = dateToYmd(addUtcDays(ymdToDate(today), -6));
 	const isoStart = ymdToIsoDate(start);
 	const isoEnd = ymdToIsoDate(today);
-	const stationId = weatherConfig(env).WU_STATION_ID;
 
 	if (env.WEATHER) {
 		try {
@@ -553,7 +601,7 @@ async function fetchHourly7Day(env: Env): Promise<WUHistoryObservation[]> {
 	}
 
 	try {
-		const raw = await fetchHistoryHourlyRawRange(env, start, today);
+		const raw = await fetchHistoryHourlyRawRange(env, stationId, start, today);
 		const parsed = parseHistoryObservations(raw.text);
 		return parsed
 			.filter((obs) => {
@@ -569,6 +617,7 @@ async function fetchHourly7Day(env: Env): Promise<WUHistoryObservation[]> {
 
 async function writeHistoryBlock(
 	env: Env,
+	stationId: string,
 	kvKey: string,
 	rawJson: string,
 	startDate: string,
@@ -578,7 +627,7 @@ async function writeHistoryBlock(
 	if (!env.WEATHER) return;
 	await env.WEATHER.put(kvKey, rawJson, {
 		metadata: {
-			stationId: weatherConfig(env).WU_STATION_ID,
+			stationId: stationId,
 			endpoint: 'hourly',
 			startDate,
 			endDate,
@@ -586,13 +635,13 @@ async function writeHistoryBlock(
 			storedAt: new Date().toISOString(),
 		},
 	});
-	await updateHistoryIndex(env, startDate, endDate, records);
+	await updateHistoryIndex(env, stationId, startDate, endDate, records);
 }
 
-async function updateHistoryIndex(env: Env, startDate: string, endDate: string, records: number): Promise<void> {
-	const existing = await readHistoryIndex(env);
+async function updateHistoryIndex(env: Env, stationId: string, startDate: string, endDate: string, records: number): Promise<void> {
+	const existing = await readHistoryIndex(env, stationId);
 	const next: HistoryIndex = {
-		stationId: weatherConfig(env).WU_STATION_ID,
+		stationId: stationId,
 		endpoint: 'hourly',
 		earliestDate:
 			existing?.earliestDate && existing.earliestDate < ymdToIsoDate(startDate)
@@ -606,16 +655,16 @@ async function updateHistoryIndex(env: Env, startDate: string, endDate: string, 
 		recordsStored: (existing?.recordsStored ?? 0) + records,
 		updatedAt: new Date().toISOString(),
 	};
-	await env.WEATHER.put(historyIndexKey(weatherConfig(env).WU_STATION_ID), JSON.stringify(next));
+	await env.WEATHER.put(historyIndexKey(stationId), JSON.stringify(next));
 }
 
-async function readHistoryIndex(env: Env): Promise<HistoryIndex | null> {
+async function readHistoryIndex(env: Env, stationId: string): Promise<HistoryIndex | null> {
 	if (!env.WEATHER) return null;
-	const raw = await env.WEATHER.get(historyIndexKey(weatherConfig(env).WU_STATION_ID));
+	const raw = await env.WEATHER.get(historyIndexKey(stationId));
 	if (!raw) return null;
 	try {
 		const parsed = JSON.parse(raw) as Partial<HistoryIndex>;
-		if (parsed.stationId !== weatherConfig(env).WU_STATION_ID) return null;
+		if (parsed.stationId !== stationId) return null;
 		return {
 			stationId: parsed.stationId,
 			endpoint: 'hourly',
@@ -630,13 +679,13 @@ async function readHistoryIndex(env: Env): Promise<HistoryIndex | null> {
 	}
 }
 
-async function readBackfillState(env: Env): Promise<BackfillState | null> {
+async function readBackfillState(env: Env, stationId: string): Promise<BackfillState | null> {
 	if (!env.WEATHER) return null;
-	const raw = await env.WEATHER.get(backfillStateKey(weatherConfig(env).WU_STATION_ID));
+	const raw = await env.WEATHER.get(backfillStateKey(stationId));
 	if (!raw) return null;
 	try {
 		const parsed = JSON.parse(raw) as BackfillState;
-		return parsed.stationId === weatherConfig(env).WU_STATION_ID ? parsed : null;
+		return parsed.stationId === stationId ? parsed : null;
 	} catch {
 		return null;
 	}
@@ -659,8 +708,12 @@ function backfillStateKey(stationId: string): string {
 	return `${HISTORY_PREFIX}:${stationId}:backfill`;
 }
 
-async function handleHistoryDaily(req: Request, env: Env): Promise<Response> {
+async function handleHistoryDaily(req: Request, env: Env, fallbackStationId?: string): Promise<Response> {
 	const url = new URL(req.url);
+	const stationId = url.searchParams.get('stationId') ?? fallbackStationId ?? getDefaultStation(env);
+	if (!stationId) {
+		return jsonResponse({ error: 'Missing stationId. Pass ?stationId=ID or configure a default station.' }, 400);
+	}
 	const today = dateToYmd(new Date());
 	const defaultEnd = ymdToIsoDate(dateToYmd(addUtcDays(ymdToDate(today), -1)));
 	const defaultStart = ymdToIsoDate(dateToYmd(addUtcDays(ymdToDate(today), -30)));
@@ -676,13 +729,12 @@ async function handleHistoryDaily(req: Request, env: Env): Promise<Response> {
 		return jsonResponse({ error: 'Range is too large. Request at most 371 days.' }, 400);
 	}
 
-	const days = await loadHistoryDailyRange(env, start, end);
-	return jsonResponse({ stationId: weatherConfig(env).WU_STATION_ID, start, end, days, index: await readHistoryIndex(env) });
+	const days = await loadHistoryDailyRange(env, stationId, start, end);
+	return jsonResponse({ stationId: stationId, start, end, days, index: await readHistoryIndex(env, stationId) });
 }
 
-async function loadHistoryDailyRange(env: Env, start: string, end: string): Promise<DailyWeather[]> {
+async function loadHistoryDailyRange(env: Env, stationId: string, start: string, end: string): Promise<DailyWeather[]> {
 	if (!env.WEATHER) return [];
-	const stationId = weatherConfig(env).WU_STATION_ID;
 	const entries = await listHistoryBlockKeys(env, stationId, isoDateToYmd(start), isoDateToYmd(end));
 	const blocks = await Promise.all(entries.map((entry) => env.WEATHER.get(entry.name)));
 	const observations = blocks.flatMap((raw) => parseHistoryObservations(raw));
@@ -783,13 +835,13 @@ function normalizeHistoryDay(date: string, observations: WUHistoryObservation[])
 	};
 }
 
-async function loadDailySummaries(env: Env): Promise<{ days: DailyWeather[]; source: string; warning: string | null }> {
+async function loadDailySummaries(env: Env, stationId: string): Promise<{ days: DailyWeather[]; source: string; warning: string | null }> {
 	try {
-		const days = await fetchDailySummaries(env);
-		await cacheDailySummaries(env, days);
+		const days = await fetchDailySummaries(env, stationId);
+		await cacheDailySummaries(env, stationId, days);
 		return { days, source: 'Weather Company daily summary', warning: null };
 	} catch (err: unknown) {
-		const cachedDays = await readCachedDailySummaries(env);
+		const cachedDays = await readCachedDailySummaries(env, stationId);
 		if (cachedDays.length > 0) {
 			const msg = err instanceof Error ? err.message : String(err);
 			return {
@@ -802,17 +854,17 @@ async function loadDailySummaries(env: Env): Promise<{ days: DailyWeather[]; sou
 	}
 }
 
-async function cacheDailySummaries(env: Env, days: DailyWeather[]): Promise<void> {
+async function cacheDailySummaries(env: Env, stationId: string, days: DailyWeather[]): Promise<void> {
 	if (!env.WEATHER || days.length === 0) return;
-	await env.WEATHER.put(dailySummariesCacheKey(weatherConfig(env).WU_STATION_ID), JSON.stringify(days), {
-		metadata: { stationId: weatherConfig(env).WU_STATION_ID, cachedAt: new Date().toISOString() },
+	await env.WEATHER.put(dailySummariesCacheKey(stationId), JSON.stringify(days), {
+		metadata: { stationId: stationId, cachedAt: new Date().toISOString() },
 	});
 }
 
-async function readCachedDailySummaries(env: Env): Promise<DailyWeather[]> {
+async function readCachedDailySummaries(env: Env, stationId: string): Promise<DailyWeather[]> {
 	if (!env.WEATHER) return [];
 
-	const raw = await env.WEATHER.get(dailySummariesCacheKey(weatherConfig(env).WU_STATION_ID));
+	const raw = await env.WEATHER.get(dailySummariesCacheKey(stationId));
 	if (!raw) return [];
 
 	try {
@@ -1736,7 +1788,7 @@ function renderDashboard(d: DashboardData, includeLiveReload: boolean): string {
     submit.disabled = true;
     setStatus('Loading ' + startInput.value + ' to ' + endInput.value + '...');
     try {
-      const res = await fetch('/api/history/daily?start=' + encodeURIComponent(startInput.value) + '&end=' + encodeURIComponent(endInput.value));
+      const res = await fetch('/api/history/daily?stationId=' + encodeURIComponent('${escHtml(d.stationId)}') + '&start=' + encodeURIComponent(startInput.value) + '&end=' + encodeURIComponent(endInput.value));
       const body = await res.json();
       if (!res.ok) throw new Error(body.error || 'History request failed.');
       renderTable(body.days || []);
@@ -1880,6 +1932,33 @@ function fmtPrettyDate(ymd: string): string {
 	});
 }
 
+function renderHomePage(stationIds: string[]): string {
+	const links = stationIds.map((id) =>
+		'<li><a href="/pws/' + escHtml(id) + '/dashboard">' + escHtml(id) + '</a> — <a href="/pws/' + escHtml(id) + '/rain-yesterday">yesterday\'s rain</a></li>'
+	).join('');
+
+	return `<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Weather Stations</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #08111d; color: #e9eef4; padding: 24px; max-width: 800px; margin: 0 auto; }
+  h1 { color: #f4f8fb; }
+  a { color: #56c7ff; text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  ul { line-height: 2; }
+  .empty { color: #94a8b8; }
+</style>
+</head>
+<body>
+  <h1>Weather Dashboard</h1>
+  <p>Select a Personal Weather Station:</p>
+  ${stationIds.length ? '<ul>' + links + '</ul>' : '<p class="empty">No stations configured. Set WU_STATION_IDS.</p>'}
+</body>
+</html>`;
+}
+
 function renderYesterdayRain(d: DashboardData): string {
 	const yesterday = d.yesterday;
 	const prettyDate = yesterday?.date ? fmtPrettyDate(yesterday.date) : 'unknown date';
@@ -1970,7 +2049,7 @@ function renderYesterdayRain(d: DashboardData): string {
   <div class="meta">
     Timezone: ${escHtml(tz)}<br>
     Source: ${escHtml(d.dataSource)}${d.warning ? `<br><span class="warning">${escHtml(d.warning)}</span>` : ''}<br>
-    <a href="/">Full dashboard →</a>
+    <a href="/pws/${escHtml(d.stationId)}/dashboard">Full dashboard →</a>
   </div>
 </main>
 </body>

@@ -10,13 +10,34 @@ import QRCode from 'qrcode';
 const execAsync = promisify(exec);
 
 /**
- * Route definitions: path → display title above the QR code.
+ * Per-station question routes: slug → display title above the QR code.
+ * Routes are generated for every station in WU_STATION_IDS.
  * Add new entries here as the app grows more pages.
  */
-const ROUTES = new Map([
-  ['/', 'Full Weather Dashboard'],
-  ['/rain-yesterday', 'How much rain did we get yesterday?'],
-]);
+const QUESTIONS = [
+  { slug: 'dashboard', title: 'Full Weather Dashboard' },
+  { slug: 'rain-yesterday', title: 'How much rain did we get yesterday?' },
+];
+
+async function buildRoutes() {
+  const devVars = await readDevVars('.dev.vars');
+  const raw = process.env.WU_STATION_IDS ?? devVars.WU_STATION_IDS ?? '';
+  const stationIds = raw.split(',').map((s) => s.trim()).filter(Boolean);
+  if (stationIds.length === 0) {
+    fail('No stations configured. Set WU_STATION_IDS (comma-separated) in env or .dev.vars.');
+  }
+  const routes = [];
+  for (const stationId of stationIds) {
+    for (const q of QUESTIONS) {
+      routes.push({
+        path: `/pws/${encodeURIComponent(stationId)}/${q.slug}`,
+        title: `${q.title} — ${stationId}`,
+        slug: `${stationId}-${q.slug}`,
+      });
+    }
+  }
+  return routes;
+}
 
 const args = parseArgs(process.argv.slice(2));
 
@@ -45,11 +66,13 @@ const shouldOpen = args.open === '1';
 
 await mkdir(outDir, { recursive: true });
 
+const routes = await buildRoutes();
+
 let outputPath;
 if (format === 'html') {
-  outputPath = await generateHtml(outDir, baseUrl, width);
+  outputPath = await generateHtml(outDir, baseUrl, width, routes);
 } else if (format === 'svg') {
-  await generateIndividualSvgs(outDir, baseUrl, width);
+  await generateIndividualSvgs(outDir, baseUrl, width, routes);
 } else {
   fail(`Unknown format: ${format}. Use html or svg.`);
 }
@@ -139,10 +162,10 @@ async function inferUrlFromWranglerConfig() {
   return null;
 }
 
-async function generateHtml(outDir, baseUrl, width) {
+async function generateHtml(outDir, baseUrl, width, routes) {
   const cards = [];
   const items = [];
-  for (const [route, title] of ROUTES) {
+  for (const { path: route, title } of routes) {
     const url = `${baseUrl}${route}`;
     const svg = await QRCode.toString(url, {
       type: 'svg',
@@ -245,10 +268,9 @@ ${cards.join('\n')}
   return outPath;
 }
 
-async function generateIndividualSvgs(outDir, baseUrl, width) {
-  for (const [route, title] of ROUTES) {
+async function generateIndividualSvgs(outDir, baseUrl, width, routes) {
+  for (const { path: route, title, slug } of routes) {
     const url = `${baseUrl}${route}`;
-    const slug = route === '/' ? 'home' : route.replace(/^\//, '').replace(/\//g, '-');
     const svg = await QRCode.toString(url, {
       type: 'svg',
       width,
