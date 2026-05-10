@@ -424,14 +424,14 @@ async function fetchNeighborRainfallForDate(
 	return Promise.all(
 		entry.neighbors.map(async (n): Promise<NeighborRainReading> => {
 			try {
-				const days = await fetchDailySummaries(env, n.stationId);
+				const days = await loadHistoryDailyRange(env, n.stationId, date, date);
 				const match = days.find((d) => d.date === date);
 				return {
 					stationId: n.stationId,
 					name: n.name,
 					distanceMi: n.distanceMi,
 					rainfall: match?.rainfall ?? null,
-					error: match ? null : 'no matching day',
+					error: match ? null : 'no data in KV',
 				};
 			} catch (err: unknown) {
 				return {
@@ -976,20 +976,15 @@ function normalizeHistoryDay(date: string, observations: WUHistoryObservation[])
 }
 
 async function loadDailySummaries(env: Env, stationId: string): Promise<{ days: DailyWeather[]; source: string; warning: string | null }> {
+	const cachedDays = await readCachedDailySummaries(env, stationId);
+	if (cachedDays.length > 0) {
+		return { days: cachedDays, source: 'KV cache (refreshed by cron every 15m)', warning: null };
+	}
 	try {
 		const days = await fetchDailySummaries(env, stationId);
 		await cacheDailySummaries(env, stationId, days);
-		return { days, source: 'wunderground.com /v2/pws/dailysummary/7day', warning: null };
+		return { days, source: 'wunderground.com /v2/pws/dailysummary/7day (cache miss)', warning: null };
 	} catch (err: unknown) {
-		const cachedDays = await readCachedDailySummaries(env, stationId);
-		if (cachedDays.length > 0) {
-			const msg = err instanceof Error ? err.message : String(err);
-			return {
-				days: cachedDays,
-				source: 'KV cache (wunderground.com /v2/pws/dailysummary/7day)',
-				warning: `Historical API unavailable; showing cached data. ${msg}`,
-			};
-		}
 		throw err;
 	}
 }
@@ -2092,40 +2087,14 @@ function fmtTempRange(day: DailyWeather | null | undefined): string {
 }
 
 
-function renderHomePage(stationIds: string[]): string {
-	const links = stationIds.map((id) =>
-		'<li><a href="/pws/' + escHtml(id) + '/dashboard">' + escHtml(id) + '</a></li>'
-	).join('');
+const STATION_MAP_HEAD = `<link rel="stylesheet" href="/vendor/leaflet/leaflet.css">
+<script src="/vendor/leaflet/leaflet.js"></script>`;
 
-	return `<!DOCTYPE html>
-<html lang="en">
-<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Weather Stations</title>
-<link rel="stylesheet" href="/vendor/leaflet/leaflet.css">
-<script src="/vendor/leaflet/leaflet.js"></script>
-<style>
-  *, *::before, *::after { box-sizing: border-box; }
-  html, body { margin: 0; padding: 0; }
-  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f7f9fc; color: #1a1f2c; }
-  .wrap { max-width: 1100px; margin: 0 auto; padding: 24px; }
-  h1 { color: #1a1f2c; margin: 0 0 16px; }
-  a { color: #0e7fcf; text-decoration: none; }
-  a:hover { text-decoration: underline; }
-  ul { line-height: 2; }
-  .empty { color: #5a6878; }
-  #map { height: 60vh; min-height: 420px; width: 100%; border-radius: 8px; background: #eef2f7; }
-  .leaflet-container { background: #eef2f7; }
-  .leaflet-popup-content a { color: #1a6fd6; }
-</style>
-</head>
-<body>
-  <div class="wrap">
-    <h1>Weather Dashboard</h1>
-    <div id="map"></div>
-    <p>Select a Personal Weather Station:</p>
-    ${stationIds.length ? '<ul>' + links + '</ul>' : '<p class="empty">No stations configured. Set WU_STATION_IDS.</p>'}
-  </div>
-<script>
+const STATION_MAP_STYLES = `#map { height: 60vh; min-height: 420px; width: 100%; border-radius: 8px; background: #eef2f7; }
+.leaflet-container { background: #eef2f7; }
+.leaflet-popup-content a { color: #1a6fd6; }`;
+
+const STATION_MAP_INIT_SCRIPT = `<script>
 (async function () {
   const el = document.getElementById('map');
   if (!el || typeof L === 'undefined') return;
@@ -2155,7 +2124,39 @@ function renderHomePage(stationIds: string[]): string {
     console.error('Failed to load station coords', err);
   }
 })();
-</script>
+</script>`;
+
+function renderHomePage(stationIds: string[]): string {
+	const links = stationIds.map((id) =>
+		'<li><a href="/pws/' + escHtml(id) + '/dashboard">' + escHtml(id) + '</a></li>'
+	).join('');
+
+	return `<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Weather Stations</title>
+${STATION_MAP_HEAD}
+<style>
+  *, *::before, *::after { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f7f9fc; color: #1a1f2c; }
+  .wrap { max-width: 1100px; margin: 0 auto; padding: 24px; }
+  h1 { color: #1a1f2c; margin: 0 0 16px; }
+  a { color: #0e7fcf; text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  ul { line-height: 2; }
+  .empty { color: #5a6878; }
+  ${STATION_MAP_STYLES}
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Weather Dashboard</h1>
+    <div id="map"></div>
+    <p>Select a Personal Weather Station:</p>
+    ${stationIds.length ? '<ul>' + links + '</ul>' : '<p class="empty">No stations configured. Set WU_STATION_IDS.</p>'}
+  </div>
+${STATION_MAP_INIT_SCRIPT}
 </body>
 </html>`;
 }
@@ -2231,6 +2232,7 @@ function renderRainPage(
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <title>${escHtml(titleVerb)} Rain at ${escHtml(d.stationId)}</title>
+${STATION_MAP_HEAD}
 <style>
   *, *::before, *::after { box-sizing: border-box; }
   body {
@@ -2244,7 +2246,7 @@ function renderRainPage(
     justify-content: center;
     padding: 24px;
   }
-  main { text-align: center; max-width: 600px; }
+  main { text-align: center; max-width: 1000px; width: 100%; }
   h1 {
     margin: 0 0 8px;
     font-size: clamp(1.2rem, 3vw, 1.6rem);
@@ -2276,6 +2278,8 @@ function renderRainPage(
   .compare-table th { color: #5a6878; font-weight: 500; font-size: .85rem; text-transform: uppercase; letter-spacing: .04em; }
   .compare-table tr.you { background: #e8f3fc; font-weight: 600; }
   .compare-table td:last-child, .compare-table th:last-child { text-align: right; }
+  .map-section { margin-top: 32px; }
+  ${STATION_MAP_STYLES}
   @media (max-width: 500px) { body { padding: 16px; } }
 </style>
 </head>
@@ -2288,14 +2292,89 @@ function renderRainPage(
 		: `<div class="none">No data available</div>`
   }
   ${comparisonBlock}
+  <div class="map-section"><div id="map"></div></div>
   <div class="meta">
     ${tz ? `Timezone: ${escHtml(tz)}<br>` : ''}
     Source: ${escHtml(d.dataSource)}${d.warning ? `<br><span class="warning">${escHtml(d.warning)}</span>` : ''}<br>
     <a href="/pws/${escHtml(d.stationId)}/dashboard">Full dashboard →</a>
   </div>
 </main>
+<script id="rain-map-data" type="application/json">${safeScriptJson(buildRainMapData(d.stationId, rainfall, neighborRain))}</script>
+<script>
+(function () {
+  const el = document.getElementById('map');
+  const dataEl = document.getElementById('rain-map-data');
+  if (!el || !dataEl || typeof L === 'undefined') return;
+  let data;
+  try { data = JSON.parse(dataEl.textContent || '{}'); } catch { return; }
+  const map = L.map(el, { zoomControl: true, attributionControl: true });
+  L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', {
+    maxZoom: 19,
+    subdomains: 'abcd',
+    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a> &copy; <a href="https://carto.com/attributions">CARTO</a>',
+  }).addTo(map);
+  map.setView([39.5, -98.35], 4);
+  const fmtRain = (v) => v == null ? 'no data' : v.toFixed(2) + '"';
+  const layers = [];
+  if (data.primary && typeof data.primary.lat === 'number' && typeof data.primary.lon === 'number') {
+    layers.push(
+      L.circleMarker([data.primary.lat, data.primary.lon], {
+        radius: 11, color: '#ffffff', weight: 2, fillColor: '#d83737', fillOpacity: 0.95,
+      })
+        .bindPopup('<strong>' + data.primary.id + '</strong> (you)<br>Rain: ' + fmtRain(data.primary.rainfall))
+        .addTo(map),
+    );
+  }
+  for (const n of (data.neighbors || [])) {
+    if (typeof n.lat !== 'number' || typeof n.lon !== 'number') continue;
+    layers.push(
+      L.circleMarker([n.lat, n.lon], {
+        radius: 7, color: '#ffffff', weight: 1.5, fillColor: '#1a6fd6', fillOpacity: 0.85,
+      })
+        .bindPopup('<strong>' + n.id + '</strong><br>' + (n.distanceMi != null ? n.distanceMi.toFixed(2) + ' mi away<br>' : '') + 'Rain: ' + fmtRain(n.rainfall))
+        .addTo(map),
+    );
+  }
+  if (layers.length === 1) {
+    map.setView(layers[0].getLatLng(), 12);
+  } else if (layers.length > 1) {
+    map.fitBounds(L.featureGroup(layers).getBounds(), { padding: [40, 40] });
+  }
+})();
+</script>
 </body>
 </html>`;
+}
+
+interface RainMapData {
+	primary: { id: string; lat: number | null; lon: number | null; rainfall: number | null };
+	neighbors: Array<{ id: string; lat: number | null; lon: number | null; rainfall: number | null; distanceMi: number | null }>;
+}
+
+function buildRainMapData(primaryId: string, primaryRainfall: number | null, neighborRain: NeighborRainReading[]): RainMapData {
+	const primaryEntry = NEIGHBORS.stations[primaryId];
+	const neighborMeta = new Map<string, NeighborEntry>();
+	for (const n of primaryEntry?.neighbors ?? []) {
+		neighborMeta.set(n.stationId, n);
+	}
+	return {
+		primary: {
+			id: primaryId,
+			lat: primaryEntry?.lat ?? null,
+			lon: primaryEntry?.lon ?? null,
+			rainfall: primaryRainfall,
+		},
+		neighbors: neighborRain.map((n) => {
+			const meta = neighborMeta.get(n.stationId);
+			return {
+				id: n.stationId,
+				lat: meta?.lat ?? null,
+				lon: meta?.lon ?? null,
+				rainfall: n.rainfall,
+				distanceMi: n.distanceMi,
+			};
+		}),
+	};
 }
 
 function escHtml(s: string): string {
