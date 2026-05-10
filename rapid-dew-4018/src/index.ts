@@ -147,6 +147,7 @@ interface DashboardData {
 	nextScheduledRun: string | null;
 	dataSource: string;
 	warning: string | null;
+	timezone: string | null;
 }
 
 const CACHE_PREFIX = 'weather:dailySummaries:v1';
@@ -185,6 +186,19 @@ export default {
 				'Missing configuration. Set WU_API_KEY and WU_STATION_ID via `npx wrangler secret put <NAME>`.',
 				{ status: 500 },
 			);
+		}
+
+		if (url.pathname === '/rain-yesterday') {
+			try {
+				const dashboard = await buildDashboard(env);
+				return new Response(renderYesterdayRain(dashboard), {
+					headers: { 'Content-Type': 'text/html; charset=utf-8' },
+				});
+			} catch (err: unknown) {
+				const msg = err instanceof Error ? err.message : String(err);
+				console.error('Yesterday rain page error:', msg);
+				return new Response(`Error: ${msg}`, { status: 500 });
+			}
 		}
 
 		try {
@@ -274,6 +288,7 @@ async function buildDashboard(env: Env): Promise<DashboardData> {
 		nextScheduledRun,
 		dataSource: dailyResult.source,
 		warning: joinWarnings(dailyResult.warning, currentResult.warning),
+		timezone: current?.tz ?? null,
 	};
 }
 
@@ -1417,12 +1432,17 @@ function renderDashboard(d: DashboardData, includeLiveReload: boolean): string {
       if (remaining <= 0) {
         nextEl.textContent = 'Running now';
         nextEl.classList.add('overdue');
-        return;
+        if (!nextEl.dataset.reloadScheduled) {
+          nextEl.dataset.reloadScheduled = '1';
+          setTimeout(() => location.reload(), 20000);
+        }
+      } else {
+        nextEl.classList.remove('overdue');
+        nextEl.dataset.reloadScheduled = '';
+        const m = Math.floor(remaining / 60000);
+        const s = Math.floor((remaining % 60000) / 1000);
+        nextEl.textContent = fmt(m, s);
       }
-      nextEl.classList.remove('overdue');
-      const m = Math.floor(remaining / 60000);
-      const s = Math.floor((remaining % 60000) / 1000);
-      nextEl.textContent = fmt(m, s);
     }
   }
 
@@ -1838,6 +1858,115 @@ function fmtTempRange(day: DailyWeather | null | undefined): string {
 	if (!day) return 'N/A';
 	if (day.tempLow === null && day.tempHigh === null) return fmtNumber(day.tempAvg, ' F');
 	return `${fmtNumber(day.tempLow, ' F')} / ${fmtNumber(day.tempHigh, ' F')}`;
+}
+
+function fmtPrettyDate(ymd: string): string {
+	const [y, m, d] = ymd.split('-').map(Number);
+	const date = new Date(Date.UTC(y, m - 1, d));
+	return date.toLocaleDateString('en-US', {
+		weekday: 'long',
+		year: 'numeric',
+		month: 'long',
+		day: 'numeric',
+		timeZone: 'UTC',
+	});
+}
+
+function renderYesterdayRain(d: DashboardData): string {
+	const yesterday = d.yesterday;
+	const prettyDate = yesterday?.date ? fmtPrettyDate(yesterday.date) : 'unknown date';
+	const rainfall = yesterday?.rainfall ?? null;
+	const tz = d.timezone ?? 'local time';
+
+	return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Yesterday's Rain at ${escHtml(d.stationId)}</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: #08111d;
+    color: #e9eef4;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+  }
+  main {
+    text-align: center;
+    max-width: 600px;
+  }
+  h1 {
+    margin: 0 0 8px;
+    font-size: clamp(1.2rem, 3vw, 1.6rem);
+    font-weight: 400;
+    color: #94a8b8;
+  }
+  .date {
+    color: #dce8ef;
+    font-size: clamp(1rem, 2.5vw, 1.4rem);
+    margin-bottom: 8px;
+  }
+  .answer {
+    font-size: clamp(3rem, 10vw, 6rem);
+    font-weight: 700;
+    color: #56c7ff;
+    line-height: 1.1;
+    margin: 16px 0 4px;
+  }
+  .unit {
+    color: #94a8b8;
+    font-size: clamp(1rem, 2.5vw, 1.4rem);
+    margin-bottom: 8px;
+  }
+  .none {
+    color: #94a8b8;
+    font-size: clamp(2rem, 6vw, 3.5rem);
+    font-weight: 600;
+    margin: 16px 0;
+  }
+  .meta {
+    color: #94a8b8;
+    font-size: .9rem;
+    margin-top: 24px;
+    line-height: 1.6;
+  }
+  .meta a {
+    color: #56c7ff;
+    text-decoration: none;
+  }
+  .meta a:hover {
+    text-decoration: underline;
+  }
+  .warning {
+    color: #f2d27a;
+  }
+  @media (max-width: 500px) {
+    body { padding: 16px; }
+  }
+</style>
+</head>
+<body>
+<main>
+  <h1>How much did it rain yesterday?</h1>
+  <div class="date">${escHtml(prettyDate)} at ${escHtml(d.stationId)}</div>
+  ${rainfall !== null
+		? `<div class="answer">${escHtml(rainfall.toFixed(2))}"</div><div class="unit">inches</div>`
+		: `<div class="none">No data available</div>`
+  }
+  <div class="meta">
+    Timezone: ${escHtml(tz)}<br>
+    Source: ${escHtml(d.dataSource)}${d.warning ? `<br><span class="warning">${escHtml(d.warning)}</span>` : ''}<br>
+    <a href="/">Full dashboard →</a>
+  </div>
+</main>
+</body>
+</html>`;
 }
 
 function escHtml(s: string): string {
