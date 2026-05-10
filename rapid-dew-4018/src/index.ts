@@ -143,6 +143,8 @@ interface DashboardData {
 	historyIndex: HistoryIndex | null;
 	current: WUCurrentObservation | null;
 	lastReading: string;
+	lastScheduledRun: string | null;
+	nextScheduledRun: string | null;
 	dataSource: string;
 	warning: string | null;
 }
@@ -225,6 +227,23 @@ function isLocalHost(hostname: string): boolean {
 	return hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '0.0.0.0';
 }
 
+function getCron15Times(now: Date = new Date()): { last: string; next: string } {
+	const minutes = now.getUTCMinutes();
+	const lastMinute = Math.floor(minutes / 15) * 15;
+	const nextMinute = lastMinute + 15;
+
+	const last = new Date(now);
+	last.setUTCMinutes(lastMinute, 0, 0);
+
+	const next = new Date(now);
+	next.setUTCMinutes(nextMinute, 0, 0);
+	if (nextMinute >= 60) {
+		next.setUTCHours(next.getUTCHours() + 1, 0, 0, 0);
+	}
+
+	return { last: last.toISOString(), next: next.toISOString() };
+}
+
 async function buildDashboard(env: Env): Promise<DashboardData> {
 	const [dailyResult, currentResult, historyIndex, hourly7Day] = await Promise.all([
 		loadDailySummaries(env),
@@ -240,6 +259,7 @@ async function buildDashboard(env: Env): Promise<DashboardData> {
 	const today = todayDate ? findDay(recentDays, todayDate) : null;
 	const yesterday = todayDate ? findPreviousDay(recentDays, todayDate) : recentDays.at(-2) ?? null;
 	const lastReading = current?.obsTimeLocal ?? current?.obsTimeUtc ?? recentDays.at(-1)?.obsTimeLocal ?? 'N/A';
+	const { last: lastScheduledRun, next: nextScheduledRun } = getCron15Times();
 
 	return {
 		stationId: env.WU_STATION_ID,
@@ -250,6 +270,8 @@ async function buildDashboard(env: Env): Promise<DashboardData> {
 		hourly7Day,
 		current,
 		lastReading,
+		lastScheduledRun,
+		nextScheduledRun,
 		dataSource: dailyResult.source,
 		warning: joinWarnings(dailyResult.warning, currentResult.warning),
 	};
@@ -974,6 +996,12 @@ function renderDashboard(d: DashboardData, includeLiveReload: boolean): string {
 	const historyIndexJson = safeScriptJson(d.historyIndex);
 	const liveReloadScript = includeLiveReload ? renderLiveReloadScript() : '';
 	const currentFreshness = fmtCurrentFreshness(d.current);
+	const staleMs = d.current?.obsTimeUtc ? Date.parse(d.current.obsTimeUtc) : null;
+	const pwsAge = staleMs && Number.isFinite(staleMs) ? Math.max(0, Math.floor((Date.now() - staleMs) / 60_000)) : null;
+	const refreshAge = d.lastScheduledRun ? Math.max(0, Math.floor((Date.now() - Date.parse(d.lastScheduledRun)) / 60_000)) : null;
+	const scheduleCountdown = d.nextScheduledRun
+		? `<span id="schedule-countdown" data-next-run="${Date.parse(d.nextScheduledRun)}">--:--</span>`
+		: '';
 	const rows = d.recentDays
 		.slice()
 		.reverse()
@@ -1026,6 +1054,16 @@ function renderDashboard(d: DashboardData, includeLiveReload: boolean): string {
   .subtitle, .meta, .footer {
     color: #94a8b8;
     font-size: .86rem;
+  }
+  #stale-timer { color: #ffb454; font-weight: 600; font-variant-numeric: tabular-nums; }
+  #schedule-countdown {
+    color: #56c7ff;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    transition: color 0.3s;
+  }
+  #schedule-countdown.overdue {
+    color: #ff6b6b;
   }
   .metric-grid {
     display: grid;
@@ -1266,7 +1304,12 @@ function renderDashboard(d: DashboardData, includeLiveReload: boolean): string {
       <h1>${escHtml(d.stationId)}</h1>
       <div class="subtitle">Temperature, rain, wind avg, and gusts</div>
     </div>
-    <div class="meta">Last reading: ${escHtml(d.lastReading)}${currentFreshness ? `<br>${escHtml(currentFreshness)}` : ''}</div>
+    <div class="meta">
+      PWS → WU: ${escHtml(d.lastReading)}${pwsAge !== null ? ` (${fmtDuration(pwsAge)} ago)` : ''}<br>
+      Last worker refresh: ${d.lastScheduledRun ? escHtml(d.lastScheduledRun.slice(11, 16)) + ' UTC' + (refreshAge !== null ? ` (${fmtDuration(refreshAge)} ago)` : '') : 'N/A'}<br>
+      Reading stale: ${staleMs && Number.isFinite(staleMs) ? `<span id="stale-timer" data-stale-ms="${staleMs}">--:--</span>` : 'N/A'}<br>
+      Next fetch: ${scheduleCountdown || 'N/A'}
+    </div>
   </header>
 
   ${d.warning ? `<div class="notice">${escHtml(d.warning)}</div>` : ''}
@@ -1348,6 +1391,45 @@ function renderDashboard(d: DashboardData, includeLiveReload: boolean): string {
     Daily trends come from /v2/pws/dailysummary/7day; live values come from /v2/pws/observations/current.
   </div>
 </main>
+<script>
+(function() {
+  const staleEl = document.getElementById('stale-timer');
+  const nextEl = document.getElementById('schedule-countdown');
+
+  function fmt(m, s) {
+    return m + ':' + (s < 10 ? '0' : '') + s;
+  }
+
+  function tick() {
+    const now = Date.now();
+
+    if (staleEl) {
+      const staleMs = parseInt(staleEl.dataset.staleMs, 10);
+      const totalSec = Math.floor((now - staleMs) / 1000);
+      const m = Math.floor(totalSec / 60);
+      const s = totalSec % 60;
+      staleEl.textContent = fmt(m, s);
+    }
+
+    if (nextEl) {
+      const nextMs = parseInt(nextEl.dataset.nextRun, 10);
+      const remaining = nextMs - now;
+      if (remaining <= 0) {
+        nextEl.textContent = 'Running now';
+        nextEl.classList.add('overdue');
+        return;
+      }
+      nextEl.classList.remove('overdue');
+      const m = Math.floor(remaining / 60000);
+      const s = Math.floor((remaining % 60000) / 1000);
+      nextEl.textContent = fmt(m, s);
+    }
+  }
+
+  tick();
+  setInterval(tick, 1000);
+})();
+</script>
 <script src="/vendor/uplot/uPlot.iife.min.js"></script>
 <script>
 (() => {
