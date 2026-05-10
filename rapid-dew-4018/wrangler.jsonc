@@ -4,7 +4,7 @@
  */
 {
 	"$schema": "node_modules/wrangler/config-schema.json",
-	"name": "rapid-dew-4018",
+	"name": "weather",
 	"main": "src/index.ts",
 	"compatibility_date": "2026-05-10",
 	"observability": {

@@ -73,7 +73,7 @@ async function resolveBaseUrl(args) {
   // Priority 3: .dev.vars DEPLOYED_URL
   const devVars = await readDevVars('.dev.vars');
   if (devVars.DEPLOYED_URL) {
-    const url = normalizeUrl(devVars.DEPLOYED_URL);
+    const url = devVars.DEPLOYED_URL.replace(/\/$/, '');
     console.error(`Using DEPLOYED_URL from .dev.vars: ${url}`);
     return url;
   }
@@ -89,7 +89,7 @@ async function resolveBaseUrl(args) {
   const configUrl = await inferUrlFromWranglerConfig();
   if (configUrl) {
     console.error(`Inferred URL from wrangler.jsonc: ${configUrl}`);
-    console.error(`Tip: Add DEPLOYED_URL=your-domain.com to .dev.vars to override.`);
+    console.error(`Tip: Add DEPLOYED_URL=https://your-domain.com to .dev.vars to override.`);
     return configUrl;
   }
 
@@ -294,12 +294,6 @@ function parseArgs(argv) {
   return parsed;
 }
 
-function normalizeUrl(value) {
-  const trimmed = value.trim().replace(/\/$/, '');
-  if (/^https?:\/\//i.test(trimmed)) return trimmed;
-  return `https://${trimmed}`;
-}
-
 function toCamel(value) {
   return value.replace(/-([a-z])/g, (_, letter) => letter.toUpperCase());
 }
@@ -352,7 +346,7 @@ Generate QR codes for each public page in the app.
 Auto-detects the production URL in this order:
   1. --base-url argument
   2. QR_BASE_URL env var
-  3. DEPLOYED_URL in .dev.vars (bare domain, https:// prepended automatically)
+  3. DEPLOYED_URL in .dev.vars
   4. wrangler deployments list (requires local Cloudflare auth)
   5. wrangler.jsonc name → https://<name>.workers.dev
 
