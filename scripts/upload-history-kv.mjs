@@ -140,7 +140,7 @@ async function readBlocks(rootDir) {
 
 async function remoteKeyExists(key) {
 	if (dryRun || force) return false;
-	const result = await runWrangler(['kv', 'key', 'get', key, ...wranglerScopeArgs()], { capture: true });
+	const result = await runWrangler(['kv', 'key', 'get', key, '--binding', binding, ...wranglerScopeArgs()], { capture: true });
 	return result.code === 0;
 }
 
