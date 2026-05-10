@@ -70,17 +70,26 @@ async function resolveBaseUrl(args) {
     return envUrl.replace(/\/$/, '');
   }
 
-  // Priority 3: wrangler deployments list (requires local CF auth)
+  // Priority 3: .dev.vars CUSTOM_DOMAIN
+  const devVars = await readDevVars('.dev.vars');
+  if (devVars.CUSTOM_DOMAIN) {
+    const url = devVars.CUSTOM_DOMAIN.replace(/\/$/, '');
+    console.error(`Using CUSTOM_DOMAIN from .dev.vars: ${url}`);
+    return url;
+  }
+
+  // Priority 4: wrangler deployments list (requires local CF auth)
   const wranglerUrl = await fetchWranglerDeploymentUrl();
   if (wranglerUrl) {
     console.error(`Auto-detected URL from wrangler: ${wranglerUrl}`);
     return wranglerUrl;
   }
 
-  // Priority 4: construct from wrangler.jsonc name
+  // Priority 5: construct from wrangler.jsonc name
   const configUrl = await inferUrlFromWranglerConfig();
   if (configUrl) {
     console.error(`Inferred URL from wrangler.jsonc: ${configUrl}`);
+    console.error(`Tip: Add CUSTOM_DOMAIN=https://your-domain.com to .dev.vars to override.`);
     return configUrl;
   }
 
@@ -294,6 +303,23 @@ function fail(message) {
   process.exit(1);
 }
 
+async function readDevVars(filePath) {
+  try {
+    const raw = await readFile(filePath, 'utf8');
+    const env = {};
+    for (const line of raw.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) continue;
+      const idx = trimmed.indexOf('=');
+      if (idx === -1) continue;
+      env[trimmed.slice(0, idx)] = trimmed.slice(idx + 1).trim();
+    }
+    return env;
+  } catch {
+    return {};
+  }
+}
+
 async function openInBrowser(filePath) {
   let command, args;
   if (process.platform === 'darwin') {
@@ -320,8 +346,9 @@ Generate QR codes for each public page in the app.
 Auto-detects the production URL in this order:
   1. --base-url argument
   2. QR_BASE_URL env var
-  3. wrangler deployments list (requires local Cloudflare auth)
-  4. wrangler.jsonc name → https://<name>.workers.dev
+  3. CUSTOM_DOMAIN in .dev.vars
+  4. wrangler deployments list (requires local Cloudflare auth)
+  5. wrangler.jsonc name → https://<name>.workers.dev
 
 Options:
   --base-url <url>   Override auto-detection.
