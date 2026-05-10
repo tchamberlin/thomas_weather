@@ -139,6 +139,7 @@ interface DashboardData {
 	yesterday: DailyWeather | null;
 	today: DailyWeather | null;
 	recentDays: DailyWeather[];
+	hourly7Day: WUHistoryObservation[];
 	historyIndex: HistoryIndex | null;
 	current: WUCurrentObservation | null;
 	lastReading: string;
@@ -225,10 +226,11 @@ function isLocalHost(hostname: string): boolean {
 }
 
 async function buildDashboard(env: Env): Promise<DashboardData> {
-	const [dailyResult, currentResult, historyIndex] = await Promise.all([
+	const [dailyResult, currentResult, historyIndex, hourly7Day] = await Promise.all([
 		loadDailySummaries(env),
 		loadCurrent(env),
 		readHistoryIndex(env),
+		fetchHourly7Day(env),
 	]);
 	const current = currentResult.current;
 	const recentDays = dailyResult.days;
@@ -245,6 +247,7 @@ async function buildDashboard(env: Env): Promise<DashboardData> {
 		today: mergeTodayWithCurrent(today, current, todayDate),
 		recentDays,
 		historyIndex,
+		hourly7Day,
 		current,
 		lastReading,
 		dataSource: dailyResult.source,
@@ -477,6 +480,48 @@ async function refreshRecentHistory(env: Env): Promise<void> {
 	const raw = await fetchHistoryHourlyRawRange(env, start, end);
 	const stationId = weatherConfig(env).WU_STATION_ID;
 	await writeHistoryBlock(env, historyBlockKey(stationId, start, end), raw.text, start, end, raw.records);
+}
+
+async function fetchHourly7Day(env: Env): Promise<WUHistoryObservation[]> {
+	const today = dateToYmd(new Date());
+	const start = dateToYmd(addUtcDays(ymdToDate(today), -6));
+	const isoStart = ymdToIsoDate(start);
+	const isoEnd = ymdToIsoDate(today);
+	const stationId = weatherConfig(env).WU_STATION_ID;
+
+	if (env.WEATHER) {
+		try {
+			const entries = await listHistoryBlockKeys(env, stationId, start, today);
+			if (entries.length > 0) {
+				const blocks = await Promise.all(entries.map((entry) => env.WEATHER.get(entry.name)));
+				const observations = blocks.flatMap((raw) => parseHistoryObservations(raw));
+				const filtered = observations.filter((obs) => {
+					if (!obs.obsTimeLocal) return false;
+					const date = localDate(obs.obsTimeLocal);
+					return date >= isoStart && date <= isoEnd;
+				});
+				if (filtered.length > 0) {
+					return filtered.sort((a, b) => (a.epoch ?? 0) - (b.epoch ?? 0));
+				}
+			}
+		} catch {
+			// Fall through to API
+		}
+	}
+
+	try {
+		const raw = await fetchHistoryHourlyRawRange(env, start, today);
+		const parsed = parseHistoryObservations(raw.text);
+		return parsed
+			.filter((obs) => {
+				if (!obs.obsTimeLocal) return false;
+				const date = localDate(obs.obsTimeLocal);
+				return date >= isoStart && date <= isoEnd;
+			})
+			.sort((a, b) => (a.epoch ?? 0) - (b.epoch ?? 0));
+	} catch {
+		return [];
+	}
 }
 
 async function writeHistoryBlock(
@@ -898,7 +943,7 @@ function jsonResponse(value: unknown, status = 200): Response {
 
 function renderDashboard(d: DashboardData, includeLiveReload: boolean): string {
 	const current = d.current?.imperial;
-	const chartDays = mergeRecentToday(d.recentDays, d.today);
+	const hourlyChartPayload = buildHourlyChartPayload(d.hourly7Day);
 	const metrics = [
 		metricPanel({
 			title: 'Current Temp',
@@ -925,7 +970,7 @@ function renderDashboard(d: DashboardData, includeLiveReload: boolean): string {
 			color: '#e879f9',
 		}),
 	].join('');
-	const chartJson = safeScriptJson(buildChartPayload(chartDays));
+	const chartJson = safeScriptJson(hourlyChartPayload);
 	const historyIndexJson = safeScriptJson(d.historyIndex);
 	const liveReloadScript = includeLiveReload ? renderLiveReloadScript() : '';
 	const currentFreshness = fmtCurrentFreshness(d.current);
@@ -1408,21 +1453,97 @@ function renderDashboard(d: DashboardData, includeLiveReload: boolean): string {
     const d = new Date(ts * 1000);
     return d.toLocaleDateString(undefined, { weekday: 'short', month: 'numeric', day: 'numeric' }) + ' ' + d.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
   };
-  chartApi.makePlot({
-    el,
-    readout,
-    x: payload.x,
-    tempLow: payload.tempLow,
-    tempAvg: payload.tempAvg,
-    tempHigh: payload.tempHigh,
-    rainfall: payload.rainfall,
-    windAvg: payload.windAvg,
-    windGustHigh: payload.windGustHigh,
-    labelFormatter: fmtDay,
-    readoutLabelFormatter: fmtDay,
-    rotate: 45,
-    space: 56,
-  });
+  // 7-day hourly chart (single line per metric, no min/max bands)
+  const fmtNumber = (value, suffix, digits = 1) =>
+    value == null ? 'N/A' : value.toFixed(digits).replace(/\\.0$/, '') + suffix;
+
+  const renderReadout = (idx) => {
+    if (!readout || idx == null || idx < 0) return;
+    readout.innerHTML = [
+      '<div>' + fmtDay(payload.x[idx]) + '</div>',
+      '<div>Temp <span style="--readout-color:#ffb454">' + fmtNumber(payload.temp[idx], ' F') + '</span></div>',
+      '<div>Rain <span style="--readout-color:#56c7ff">' + fmtNumber(payload.rainfall[idx], ' in', 2) + '</span></div>',
+      '<div>Wind <span style="--readout-color:#7bd88f">' + fmtNumber(payload.windAvg[idx], ' mph') + '</span></div>',
+      '<div>Gust <span style="--readout-color:#e879f9">' + fmtNumber(payload.windGustHigh[idx], ' mph') + '</span></div>',
+    ].join('');
+  };
+
+  const opts = {
+    width: el.clientWidth,
+    height: el.clientHeight,
+    cursor: { drag: { x: false, y: false } },
+    legend: { show: false, live: false },
+    hooks: {
+      setCursor: [
+        (u) => {
+          const idx = u.cursor.idx;
+          if (idx != null) renderReadout(idx);
+        },
+      ],
+    },
+    scales: {
+      x: { time: true },
+      temp: { auto: true },
+      rain: { auto: true, range: (u, min, max) => [0, Math.max(0.1, max * 1.2)] },
+      wind: { auto: true, range: (u, min, max) => [0, Math.max(8, max * 1.15)] },
+    },
+    axes: [
+      {
+        stroke: '#7f93a5',
+        grid: { stroke: '#26384d', width: 1 },
+        values: (u, ticks) => ticks.map(fmtDay),
+        rotate: 45,
+        space: 80,
+        align: 2,
+        size: 80,
+      },
+      {
+        scale: 'temp',
+        label: 'F',
+        size: 42,
+        stroke: '#ffb454',
+        grid: { stroke: '#26384d', width: 1 },
+      },
+      {
+        scale: 'rain',
+        label: 'in',
+        side: 1,
+        size: 42,
+        stroke: '#56c7ff',
+        grid: { show: false },
+      },
+      {
+        scale: 'wind',
+        label: 'mph',
+        side: 1,
+        size: 46,
+        stroke: '#b98cff',
+        grid: { show: false },
+      },
+    ],
+    series: [
+      {},
+      { label: 'Temp', scale: 'temp', stroke: '#ffb454', width: 2, points: { show: false } },
+      {
+        label: 'Rain',
+        scale: 'rain',
+        stroke: '#56c7ff',
+        fill: '#56c7ff66',
+        width: 1,
+        paths: uPlot.paths.bars({ size: [0.82, Infinity, 1], align: 0 }),
+        points: { show: false },
+      },
+      { label: 'Wind avg', scale: 'wind', stroke: '#7bd88f', width: 2, points: { show: false } },
+      { label: 'Gusts', scale: 'wind', stroke: '#e879f9', width: 2, dash: [8, 5], points: { show: false } },
+    ],
+  };
+
+  const plot = new uPlot(opts, [payload.x, payload.temp, payload.rainfall, payload.windAvg, payload.windGustHigh], el);
+  renderReadout(payload.x.length - 1);
+
+  addEventListener('resize', () => {
+    plot.setSize({ width: el.clientWidth, height: el.clientHeight });
+  }, { passive: true });
 })();
 </script>
 <script>
@@ -1576,6 +1697,19 @@ function buildChartPayload(days: DailyWeather[]): Record<string, Array<number | 
 		rainfall: days.map((day) => day.rainfall),
 		windAvg: days.map((day) => day.windAvg),
 		windGustHigh: days.map((day) => day.windGustHigh),
+	};
+}
+
+function buildHourlyChartPayload(observations: WUHistoryObservation[]): Record<string, Array<number | null>> {
+	const sorted = observations
+		.filter((obs) => obs.epoch != null)
+		.sort((a, b) => (a.epoch ?? 0) - (b.epoch ?? 0));
+	return {
+		x: sorted.map((obs) => obs.epoch!),
+		temp: sorted.map((obs) => numberOrNull(obs.imperial?.tempAvg ?? obs.imperial?.temp)),
+		rainfall: sorted.map((obs) => numberOrNull(obs.imperial?.precipTotal)),
+		windAvg: sorted.map((obs) => numberOrNull(obs.imperial?.windspeedAvg ?? obs.imperial?.windSpeed)),
+		windGustHigh: sorted.map((obs) => numberOrNull(obs.imperial?.windgustHigh ?? obs.imperial?.windGust)),
 	};
 }
 
