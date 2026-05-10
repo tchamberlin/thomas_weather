@@ -223,6 +223,41 @@ export default {
 			return Response.redirect(`${url.origin}/pws/${pwsBareMatch[1]}/dashboard`, 302);
 		}
 
+		// /rain[/<spec>]   all primary stations on one page
+		const allRainMatch = /^\/rain(?:\/([^/]+))?\/?$/.exec(url.pathname);
+		if (allRainMatch) {
+			const spec = allRainMatch[1] ? decodeURIComponent(allRainMatch[1]) : 'today';
+			const stationIds = getStationIds(env);
+			if (stationIds.length === 0) {
+				return new Response('No stations configured.', { status: 404 });
+			}
+			const { WU_API_KEY } = weatherConfig(env);
+			if (!WU_API_KEY) {
+				return new Response('Missing WU_API_KEY configuration.', { status: 500 });
+			}
+			try {
+				const stations = await Promise.all(stationIds.map(async (stationId) => {
+					const dashboard = await buildDashboard(env, stationId);
+					const target = resolveRainTarget(dashboard, spec);
+					if ('error' in target) return { error: target.error, stationId };
+					const [rainfall, neighborRain] = await Promise.all([
+						loadRainfallForDate(env, stationId, dashboard, target.date, target.isToday),
+						fetchNeighborRainfallForDate(env, stationId, target.date),
+					]);
+					return { stationId, dashboard, target, rainfall, neighborRain };
+				}));
+				const firstError = stations.find((s): s is { error: string; stationId: string } => 'error' in s);
+				if (firstError) return new Response(firstError.error, { status: 400 });
+				return new Response(renderAllRainPage(spec, stations as MultiRainEntry[]), {
+					headers: { 'Content-Type': 'text/html; charset=utf-8' },
+				});
+			} catch (err: unknown) {
+				const msg = err instanceof Error ? err.message : String(err);
+				console.error(`All-rain page error (${spec}):`, msg);
+				return new Response(`Error: ${msg}`, { status: 500 });
+			}
+		}
+
 		// /pws/<id>/rain[/<spec>]   spec defaults to today; can be 'today', 'yesterday', or YYYY-MM-DD
 		const pwsRainMatch = /^\/pws\/([^/]+)\/rain(?:\/([^/]+))?\/?$/.exec(url.pathname);
 		if (pwsRainMatch) {
@@ -420,27 +455,41 @@ async function fetchNeighborRainfallForDate(
 	date: string,
 ): Promise<NeighborRainReading[]> {
 	const entry = NEIGHBORS.stations[primaryId];
-	if (!entry || entry.neighbors.length === 0) return [];
+	if (!entry || entry.neighbors.length === 0) {
+		console.log(`[neighbors] no neighbors configured for primary=${primaryId}`);
+		return [];
+	}
+	console.log(`[neighbors] primary=${primaryId} date=${date} fetching for ${entry.neighbors.length} neighbors`);
 	return Promise.all(
 		entry.neighbors.map(async (n): Promise<NeighborRainReading> => {
+			const base = { stationId: n.stationId, name: n.name, distanceMi: n.distanceMi };
+			// 1. KV history blocks (primary source)
 			try {
 				const days = await loadHistoryDailyRange(env, n.stationId, date, date);
 				const match = days.find((d) => d.date === date);
-				return {
-					stationId: n.stationId,
-					name: n.name,
-					distanceMi: n.distanceMi,
-					rainfall: match?.rainfall ?? null,
-					error: match ? null : 'no data in KV',
-				};
+				if (match && match.rainfall !== null) {
+					console.log(`[neighbors] KV-HIT  ${n.stationId} ${date} rain=${match.rainfall}`);
+					return { ...base, rainfall: match.rainfall, error: null };
+				}
+				const reason = match ? 'date matched but rainfall=null' : `no block covered ${date} (blocks loaded=${days.length}, dates=${days.map((d) => d.date).join(',') || 'none'})`;
+				console.warn(`[neighbors] KV-MISS ${n.stationId} ${date} — ${reason}; trying 7-day summary fallback`);
 			} catch (err: unknown) {
-				return {
-					stationId: n.stationId,
-					name: n.name,
-					distanceMi: n.distanceMi,
-					rainfall: null,
-					error: err instanceof Error ? err.message : String(err),
-				};
+				console.warn(`[neighbors] KV-ERR  ${n.stationId} ${date}: ${err instanceof Error ? err.message : String(err)}; trying 7-day summary fallback`);
+			}
+			// 2. Fallback: WU 7-day daily summary (live API; covers today + last 6 days)
+			try {
+				const summaries = await fetchDailySummaries(env, n.stationId);
+				const summary = summaries.find((d) => d.date === date);
+				if (summary && summary.rainfall !== null) {
+					console.warn(`[neighbors] FALLBACK-HIT  ${n.stationId} ${date} rain=${summary.rainfall} (via WU 7-day summary — KV not populated for this date)`);
+					return { ...base, rainfall: summary.rainfall, error: null };
+				}
+				console.warn(`[neighbors] FALLBACK-MISS ${n.stationId} ${date} — 7-day summary returned dates=[${summaries.map((d) => d.date).join(',')}]${summary ? ' (date present but rainfall=null)' : ''}`);
+				return { ...base, rainfall: null, error: 'no data in KV or 7-day summary' };
+			} catch (err: unknown) {
+				const msg = err instanceof Error ? err.message : String(err);
+				console.warn(`[neighbors] FALLBACK-ERR  ${n.stationId} ${date}: ${msg}`);
+				return { ...base, rainfall: null, error: msg };
 			}
 		}),
 	);
@@ -2153,6 +2202,7 @@ ${STATION_MAP_HEAD}
   <div class="wrap">
     <h1>Weather Dashboard</h1>
     <div id="map"></div>
+    <p><a href="/rain/today">Rain — all stations (today)</a> · <a href="/rain/yesterday">yesterday</a></p>
     <p>Select a Personal Weather Station:</p>
     ${stationIds.length ? '<ul>' + links + '</ul>' : '<p class="empty">No stations configured. Set WU_STATION_IDS.</p>'}
   </div>
@@ -2316,24 +2366,24 @@ ${STATION_MAP_HEAD}
   map.setView([39.5, -98.35], 4);
   const fmtRain = (v) => v == null ? 'no data' : v.toFixed(2) + '"';
   const layers = [];
-  if (data.primary && typeof data.primary.lat === 'number' && typeof data.primary.lon === 'number') {
-    layers.push(
-      L.circleMarker([data.primary.lat, data.primary.lon], {
-        radius: 11, color: '#ffffff', weight: 2, fillColor: '#d83737', fillOpacity: 0.95,
-      })
-        .bindPopup('<strong>' + data.primary.id + '</strong> (you)<br>Rain: ' + fmtRain(data.primary.rainfall))
-        .addTo(map),
-    );
-  }
   for (const n of (data.neighbors || [])) {
     if (typeof n.lat !== 'number' || typeof n.lon !== 'number') continue;
     layers.push(
       L.circleMarker([n.lat, n.lon], {
-        radius: 7, color: '#ffffff', weight: 1.5, fillColor: '#1a6fd6', fillOpacity: 0.85,
+        radius: 7, color: '#ffffff', weight: 1.5, fillColor: '#1a6fd6', fillOpacity: 0.55, opacity: 0.7,
       })
         .bindPopup('<strong>' + n.id + '</strong><br>' + (n.distanceMi != null ? n.distanceMi.toFixed(2) + ' mi away<br>' : '') + 'Rain: ' + fmtRain(n.rainfall))
         .addTo(map),
     );
+  }
+  if (data.primary && typeof data.primary.lat === 'number' && typeof data.primary.lon === 'number') {
+    const m = L.circleMarker([data.primary.lat, data.primary.lon], {
+      radius: 11, color: '#ffffff', weight: 2, fillColor: '#d83737', fillOpacity: 0.75, opacity: 0.9,
+    })
+      .bindPopup('<strong>' + data.primary.id + '</strong> (you)<br>Rain: ' + fmtRain(data.primary.rainfall))
+      .addTo(map);
+    m.bringToFront();
+    layers.push(m);
   }
   if (layers.length === 1) {
     map.setView(layers[0].getLatLng(), 12);
@@ -2344,6 +2394,198 @@ ${STATION_MAP_HEAD}
 </script>
 </body>
 </html>`;
+}
+
+interface MultiRainEntry {
+	stationId: string;
+	dashboard: DashboardData;
+	target: RainTarget;
+	rainfall: number | null;
+	neighborRain: NeighborRainReading[];
+}
+
+function renderAllRainPage(spec: string, entries: MultiRainEntry[]): string {
+	const lower = spec.toLowerCase();
+	const isToday = lower === 'today';
+	const isYesterday = lower === 'yesterday';
+	const repDate = entries[0]?.target.date ?? new Date().toISOString().slice(0, 10);
+	const prettyDate = fmtPrettyDate(repDate);
+	const heading = isToday
+		? 'How much has it rained today?'
+		: isYesterday
+			? 'How much did it rain yesterday?'
+			: `How much did it rain on ${prettyDate}?`;
+	const dateLine = isToday ? `${prettyDate} (so far)` : prettyDate;
+	const titleVerb = isToday ? "Today's" : isYesterday ? "Yesterday's" : prettyDate;
+
+	const cards = entries.map((e) => renderStationRainCard(e)).join('');
+
+	return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>${escHtml(titleVerb)} Rain — All Stations</title>
+${STATION_MAP_HEAD}
+<style>
+  *, *::before, *::after { box-sizing: border-box; }
+  body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f7f9fc; color: #1a1f2c; padding: 24px; }
+  main { max-width: 1400px; margin: 0 auto; }
+  h1 { text-align: center; margin: 0 0 8px; font-size: clamp(1.2rem, 3vw, 1.6rem); font-weight: 400; color: #5a6878; }
+  .date { text-align: center; color: #1a1f2c; font-size: clamp(1rem, 2.5vw, 1.4rem); margin-bottom: 24px; }
+  .map-section { margin-bottom: 32px; }
+  .stations-row { display: flex; flex-wrap: wrap; gap: 20px; align-items: stretch; }
+  .station-card { flex: 1 1 0; min-width: 260px; background: #ffffff; border: 1px solid #e3e8ef; border-radius: 8px; padding: 16px; }
+  .station-card h2 { margin: 0 0 4px; font-size: 1rem; color: #5a6878; font-weight: 500; }
+  .station-card .answer { font-size: clamp(2rem, 4vw, 3rem); font-weight: 700; color: #0e7fcf; line-height: 1.1; margin: 8px 0 2px; }
+  .station-card .unit { color: #5a6878; font-size: .9rem; margin-bottom: 12px; }
+  .station-card .none { color: #5a6878; font-size: 1.5rem; font-weight: 600; margin: 8px 0 12px; }
+  .station-card .summary { font-size: .9rem; color: #1a1f2c; margin-bottom: 8px; }
+  .station-card table { width: 100%; border-collapse: collapse; font-size: .85rem; }
+  .station-card th, .station-card td { padding: 4px 6px; border-bottom: 1px solid #e3e8ef; text-align: left; }
+  .station-card th { color: #5a6878; font-weight: 500; font-size: .75rem; text-transform: uppercase; letter-spacing: .04em; }
+  .station-card tr.you { background: #e8f3fc; font-weight: 600; }
+  .station-card td:last-child, .station-card th:last-child { text-align: right; }
+  .station-card .dash-link { display: block; margin-top: 10px; font-size: .85rem; }
+  .station-card .dash-link a { color: #0e7fcf; text-decoration: none; }
+  .station-card .dash-link a:hover { text-decoration: underline; }
+  ${STATION_MAP_STYLES}
+</style>
+</head>
+<body>
+<main>
+  <h1>${escHtml(heading)}</h1>
+  <div class="date">${escHtml(dateLine)}</div>
+  <div class="map-section"><div id="map"></div></div>
+  <div class="stations-row">${cards}</div>
+</main>
+<script id="all-rain-map-data" type="application/json">${safeScriptJson(buildAllRainMapData(entries))}</script>
+<script>
+(function () {
+  const el = document.getElementById('map');
+  const dataEl = document.getElementById('all-rain-map-data');
+  if (!el || !dataEl || typeof L === 'undefined') return;
+  let data;
+  try { data = JSON.parse(dataEl.textContent || '{}'); } catch { return; }
+  const map = L.map(el, { zoomControl: true, attributionControl: true });
+  L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', {
+    maxZoom: 19,
+    subdomains: 'abcd',
+    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a> &copy; <a href="https://carto.com/attributions">CARTO</a>',
+  }).addTo(map);
+  map.setView([39.5, -98.35], 4);
+  const fmtRain = (v) => v == null ? 'no data' : v.toFixed(2) + '"';
+  const layers = [];
+  for (const n of (data.neighbors || [])) {
+    if (typeof n.lat !== 'number' || typeof n.lon !== 'number') continue;
+    layers.push(
+      L.circleMarker([n.lat, n.lon], {
+        radius: 7, color: '#ffffff', weight: 1.5, fillColor: '#1a6fd6', fillOpacity: 0.55, opacity: 0.7,
+      })
+        .bindPopup('<strong>' + n.id + '</strong><br>Rain: ' + fmtRain(n.rainfall))
+        .addTo(map),
+    );
+  }
+  for (const p of (data.primaries || [])) {
+    if (typeof p.lat !== 'number' || typeof p.lon !== 'number') continue;
+    const m = L.circleMarker([p.lat, p.lon], {
+      radius: 11, color: '#ffffff', weight: 2, fillColor: '#d83737', fillOpacity: 0.75, opacity: 0.9,
+    })
+      .bindPopup('<strong>' + p.id + '</strong> (primary)<br>Rain: ' + fmtRain(p.rainfall) + '<br><a href="/pws/' + encodeURIComponent(p.id) + '/rain' + (data.specPath || '') + '">Station rain page →</a>')
+      .addTo(map);
+    m.bringToFront();
+    layers.push(m);
+  }
+  if (layers.length === 1) {
+    map.setView(layers[0].getLatLng(), 12);
+  } else if (layers.length > 1) {
+    map.fitBounds(L.featureGroup(layers).getBounds(), { padding: [40, 40] });
+  }
+})();
+</script>
+</body>
+</html>`;
+}
+
+function renderStationRainCard(e: MultiRainEntry): string {
+	const { stationId, rainfall, neighborRain } = e;
+	const all: Array<{ id: string; distanceMi: number | null; rainfall: number; isPrimary: boolean }> = [];
+	if (rainfall !== null) {
+		all.push({ id: stationId, distanceMi: 0, rainfall, isPrimary: true });
+	}
+	for (const n of neighborRain) {
+		if (n.rainfall !== null) {
+			all.push({ id: n.stationId, distanceMi: n.distanceMi, rainfall: n.rainfall, isPrimary: false });
+		}
+	}
+	const sorted = [...all].sort((a, b) => b.rainfall - a.rainfall);
+	const primaryRank = rainfall !== null ? sorted.findIndex((s) => s.isPrimary) + 1 : 0;
+	const others = sorted.filter((s) => !s.isPrimary).map((s) => s.rainfall);
+	const median = others.length > 0 ? others.slice().sort((a, b) => a - b)[Math.floor(others.length / 2)] : null;
+
+	const rows = [...all]
+		.sort((a, b) => (a.distanceMi ?? 0) - (b.distanceMi ?? 0))
+		.map((s) => {
+			const cls = s.isPrimary ? ' class="you"' : '';
+			const dist = s.isPrimary ? 'you' : s.distanceMi !== null ? `${s.distanceMi.toFixed(2)} mi` : '—';
+			return `<tr${cls}><td>${escHtml(dist)}</td><td>${escHtml(s.id)}</td><td>${escHtml(s.rainfall.toFixed(2))}"</td></tr>`;
+		})
+		.join('');
+
+	const answer = rainfall !== null
+		? `<div class="answer">${escHtml(rainfall.toFixed(2))}"</div><div class="unit">inches</div>`
+		: `<div class="none">No data</div>`;
+	const summary = all.length > 1
+		? `<div class="summary">Ranked <strong>${primaryRank}</strong> of <strong>${sorted.length}</strong>${median !== null ? ` · median <strong>${escHtml(median.toFixed(2))}"</strong>` : ''}</div>`
+		: '';
+
+	return `<div class="station-card">
+    <h2>${escHtml(stationId)}</h2>
+    ${answer}
+    ${summary}
+    <table>
+      <thead><tr><th>Dist</th><th>Station</th><th>Rain</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+    <div class="dash-link"><a href="/pws/${escHtml(stationId)}/rain/${escHtml(e.target.date)}">Station page →</a></div>
+  </div>`;
+}
+
+interface AllRainMapData {
+	primaries: Array<{ id: string; lat: number | null; lon: number | null; rainfall: number | null }>;
+	neighbors: Array<{ id: string; lat: number | null; lon: number | null; rainfall: number | null }>;
+	specPath: string;
+}
+
+function buildAllRainMapData(entries: MultiRainEntry[]): AllRainMapData {
+	const primaries: AllRainMapData['primaries'] = [];
+	const neighborMap = new Map<string, { id: string; lat: number | null; lon: number | null; rainfall: number | null }>();
+	const primaryIds = new Set(entries.map((e) => e.stationId));
+	for (const e of entries) {
+		const entry = NEIGHBORS.stations[e.stationId];
+		primaries.push({
+			id: e.stationId,
+			lat: entry?.lat ?? null,
+			lon: entry?.lon ?? null,
+			rainfall: e.rainfall,
+		});
+		const neighborMeta = new Map<string, NeighborEntry>();
+		for (const n of entry?.neighbors ?? []) neighborMeta.set(n.stationId, n);
+		for (const nr of e.neighborRain) {
+			if (primaryIds.has(nr.stationId)) continue;
+			const meta = neighborMeta.get(nr.stationId);
+			const existing = neighborMap.get(nr.stationId);
+			if (existing && existing.rainfall !== null) continue;
+			neighborMap.set(nr.stationId, {
+				id: nr.stationId,
+				lat: meta?.lat ?? null,
+				lon: meta?.lon ?? null,
+				rainfall: nr.rainfall,
+			});
+		}
+	}
+	const specPath = entries[0]?.target.date ? `/${entries[0].target.date}` : '';
+	return { primaries, neighbors: Array.from(neighborMap.values()), specPath };
 }
 
 interface RainMapData {
