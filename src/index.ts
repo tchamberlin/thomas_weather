@@ -56,6 +56,8 @@ interface WUCurrentObservation {
 	obsTimeLocal?: string;
 	obsTimeUtc?: string;
 	tz?: string;
+	lat?: number;
+	lon?: number;
 	humidity?: number;
 	realtimeFrequency?: number | null;
 	imperial?: UnitValues;
@@ -227,6 +229,12 @@ export default {
 		}
 
 		// API routes
+		if (url.pathname === '/api/stations/coords') {
+			const coords = await getAllStationCoords(env);
+			return new Response(JSON.stringify(coords), {
+				headers: { 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=300' },
+			});
+		}
 		if (url.pathname === '/api/history/daily') {
 			return handleHistoryDaily(req, env);
 		}
@@ -455,6 +463,42 @@ function getDefaultStation(env: Env): string | undefined {
 
 function isValidStation(env: Env, stationId: string): boolean {
 	return getStationIds(env).includes(stationId);
+}
+
+interface StationCoords {
+	id: string;
+	lat: number;
+	lon: number;
+}
+
+const COORDS_KV_PREFIX = 'station:coords:v1';
+const COORDS_TTL_SECONDS = 60 * 60 * 24 * 30;
+
+async function getStationCoords(env: Env, stationId: string): Promise<StationCoords | null> {
+	const key = `${COORDS_KV_PREFIX}:${stationId}`;
+	const cached = await env.WEATHER.get(key);
+	if (cached) {
+		try {
+			const parsed = JSON.parse(cached) as { lat: number; lon: number };
+			if (typeof parsed.lat === 'number' && typeof parsed.lon === 'number') {
+				return { id: stationId, lat: parsed.lat, lon: parsed.lon };
+			}
+		} catch {}
+	}
+	const current = await fetchCurrent(env, stationId).catch(() => null);
+	if (current && typeof current.lat === 'number' && typeof current.lon === 'number') {
+		await env.WEATHER.put(key, JSON.stringify({ lat: current.lat, lon: current.lon }), {
+			expirationTtl: COORDS_TTL_SECONDS,
+		});
+		return { id: stationId, lat: current.lat, lon: current.lon };
+	}
+	return null;
+}
+
+async function getAllStationCoords(env: Env): Promise<StationCoords[]> {
+	const ids = getStationIds(env);
+	const results = await Promise.all(ids.map((id) => getStationCoords(env, id)));
+	return results.filter((c): c is StationCoords => c !== null);
 }
 
 
@@ -1044,25 +1088,25 @@ function renderDashboard(d: DashboardData, includeLiveReload: boolean): string {
 			title: 'Current Temp',
 			value: fmtNumber(current?.temp ?? d.today?.tempAvg ?? null, ' F'),
 			subtitle: `Today low / high: ${fmtTempRange(d.today)}`,
-			color: '#ffb454',
+			color: '#e07b00',
 		}),
 		metricPanel({
 			title: 'Today Rain',
 			value: fmtRain(d.today?.rainfall ?? null),
 			subtitle: `Rate: ${fmtNumber(current?.precipRate ?? null, ' in/hr')}`,
-			color: '#56c7ff',
+			color: '#0e7fcf',
 		}),
 		metricPanel({
 			title: 'Current Wind',
 			value: fmtNumber(current?.windSpeed ?? d.today?.windAvg ?? null, ' mph'),
 			subtitle: `Daily avg: ${fmtNumber(d.today?.windAvg ?? null, ' mph')}`,
-			color: '#7bd88f',
+			color: '#1d9646',
 		}),
 		metricPanel({
 			title: 'Current Gust',
 			value: fmtNumber(current?.windGust ?? d.today?.windGustHigh ?? null, ' mph'),
 			subtitle: `Daily high: ${fmtNumber(d.today?.windGustHigh ?? null, ' mph')}`,
-			color: '#e879f9',
+			color: '#a020bc',
 		}),
 	].join('');
 	const chartJson = safeScriptJson(hourlyChartPayload);
@@ -1101,8 +1145,8 @@ function renderDashboard(d: DashboardData, includeLiveReload: boolean): string {
   body {
     margin: 0;
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-    background: #08111d;
-    color: #e9eef4;
+    background: #f7f9fc;
+    color: #1a1f2c;
     min-height: 100vh;
     padding: 24px;
   }
@@ -1121,22 +1165,22 @@ function renderDashboard(d: DashboardData, includeLiveReload: boolean): string {
     margin: 0 0 4px;
     font-size: clamp(1.5rem, 4vw, 2.4rem);
     font-weight: 700;
-    color: #f4f8fb;
+    color: #1a1f2c;
     overflow-wrap: anywhere;
   }
   .subtitle, .meta, .footer {
-    color: #94a8b8;
+    color: #5a6878;
     font-size: .86rem;
   }
-  #stale-timer { color: #ffb454; font-weight: 600; font-variant-numeric: tabular-nums; }
+  #stale-timer { color: #e07b00; font-weight: 600; font-variant-numeric: tabular-nums; }
   #schedule-countdown {
-    color: #56c7ff;
+    color: #0e7fcf;
     font-weight: 600;
     font-variant-numeric: tabular-nums;
     transition: color 0.3s;
   }
   #schedule-countdown.overdue {
-    color: #ff6b6b;
+    color: #d83737;
   }
   .metric-grid {
     display: grid;
@@ -1144,10 +1188,10 @@ function renderDashboard(d: DashboardData, includeLiveReload: boolean): string {
     gap: 12px;
   }
   .card, .chart-shell, .history-panel, .table-wrap {
-    background: #101c2b;
-    border: 1px solid #22344a;
+    background: #ffffff;
+    border: 1px solid #dde4ec;
     border-radius: 8px;
-    box-shadow: 0 8px 28px rgba(0,0,0,.28);
+    box-shadow: 0 1px 3px rgba(15,23,42,.06), 0 1px 2px rgba(15,23,42,.04);
   }
 	  .chart-shell {
 	    margin-bottom: 12px;
@@ -1165,7 +1209,7 @@ function renderDashboard(d: DashboardData, includeLiveReload: boolean): string {
     margin-bottom: 8px;
   }
   .chart-title {
-    color: #f4f8fb;
+    color: #1a1f2c;
     font-size: 1rem;
     font-weight: 700;
   }
@@ -1176,7 +1220,7 @@ function renderDashboard(d: DashboardData, includeLiveReload: boolean): string {
     align-items: baseline;
     margin-top: 12px;
     min-height: 42px;
-    color: #d8e3eb;
+    color: #1a1f2c;
     font-size: .82rem;
   }
   .readout div {
@@ -1191,7 +1235,7 @@ function renderDashboard(d: DashboardData, includeLiveReload: boolean): string {
     flex-wrap: wrap;
     justify-content: flex-end;
     gap: 8px 12px;
-    color: #aab9c8;
+    color: #5a6878;
     font-size: .78rem;
   }
   .legend span {
@@ -1218,7 +1262,7 @@ function renderDashboard(d: DashboardData, includeLiveReload: boolean): string {
 	    gap: 5px;
 	  }
 	  .field span {
-	    color: #a7b8c8;
+	    color: #5a6878;
 	    font-size: .76rem;
 	    font-weight: 650;
 	    text-transform: uppercase;
@@ -1226,9 +1270,9 @@ function renderDashboard(d: DashboardData, includeLiveReload: boolean): string {
 	  input[type="date"], button {
 	    height: 36px;
 	    border-radius: 6px;
-	    border: 1px solid #2b4058;
-	    background: #0b1624;
-	    color: #e9eef4;
+	    border: 1px solid #c5d0dc;
+	    background: #ffffff;
+	    color: #1a1f2c;
 	    font: inherit;
 	    font-size: .9rem;
 	  }
@@ -1239,8 +1283,8 @@ function renderDashboard(d: DashboardData, includeLiveReload: boolean): string {
 	  button {
 	    padding: 0 14px;
 	    cursor: pointer;
-	    background: #174b74;
-	    border-color: #2c80bd;
+	    background: #1a6fd6;
+	    border-color: #155cb6;
 	    font-weight: 700;
 	  }
 	  button:disabled {
@@ -1248,7 +1292,7 @@ function renderDashboard(d: DashboardData, includeLiveReload: boolean): string {
 	    opacity: .65;
 	  }
 	  .status {
-	    color: #94a8b8;
+	    color: #5a6878;
 	    font-size: .84rem;
 	    min-height: 1.3em;
 	  }
@@ -1256,7 +1300,7 @@ function renderDashboard(d: DashboardData, includeLiveReload: boolean): string {
 	    margin-top: 10px;
 	    max-height: 300px;
 	    overflow: auto;
-	    border-top: 1px solid #22344a;
+	    border-top: 1px solid #dde4ec;
 	  }
 	  .history-table table {
 	    min-width: 720px;
@@ -1266,7 +1310,7 @@ function renderDashboard(d: DashboardData, includeLiveReload: boolean): string {
     padding: 16px;
   }
   .label {
-    color: #a7b8c8;
+    color: #5a6878;
     font-size: .84rem;
     margin-bottom: 10px;
   }
@@ -1279,7 +1323,7 @@ function renderDashboard(d: DashboardData, includeLiveReload: boolean): string {
   }
   .subvalue {
     margin-top: 8px;
-    color: #b8c6d1;
+    color: #5a6878;
     font-size: .82rem;
     min-height: 1.2em;
   }
@@ -1292,7 +1336,7 @@ function renderDashboard(d: DashboardData, includeLiveReload: boolean): string {
   }
   .uplot {
     background: transparent;
-    color: #7f93a5;
+    color: #7d8b9b;
     font-family: inherit;
   }
   .uplot .u-over, .uplot .u-under {
@@ -1300,17 +1344,17 @@ function renderDashboard(d: DashboardData, includeLiveReload: boolean): string {
     border-radius: 4px;
   }
   .uplot .u-axis text {
-    fill: #7f93a5;
+    fill: #7d8b9b;
     font-size: 10px;
   }
   .uplot .u-axis path,
   .uplot .u-axis line,
   .uplot .u-grid {
-    stroke: #26384d;
+    stroke: #e6ecf3;
   }
   .uplot .u-cursor-x,
   .uplot .u-cursor-y {
-    stroke: #c7d5e0;
+    stroke: #5a6878;
   }
   .uplot .u-legend {
     display: none;
@@ -1327,27 +1371,27 @@ function renderDashboard(d: DashboardData, includeLiveReload: boolean): string {
   th, td {
     padding: 12px 14px;
     text-align: left;
-    border-bottom: 1px solid #22344a;
+    border-bottom: 1px solid #dde4ec;
     white-space: nowrap;
   }
   th {
-    color: #9fc2e8;
+    color: #3a4858;
     font-size: .78rem;
     font-weight: 650;
     text-transform: uppercase;
   }
   td {
-    color: #dce8ef;
+    color: #1a1f2c;
     font-size: .9rem;
   }
   tr:last-child td { border-bottom: 0; }
   .notice {
     margin: 12px 0;
     padding: 10px 12px;
-    border: 1px solid #715f23;
-    background: #2a260f;
+    border: 1px solid #e6c97a;
+    background: #fff5d6;
     border-radius: 8px;
-    color: #f2d27a;
+    color: #7a5a00;
     font-size: .86rem;
   }
   .footer {
@@ -1395,10 +1439,10 @@ function renderDashboard(d: DashboardData, includeLiveReload: boolean): string {
         <div id="chart-readout" class="readout"></div>
       </div>
       <div class="legend">
-        <span><i style="--legend-color:#ffb454"></i>Temp avg</span>
-        <span><i style="--legend-color:#56c7ff"></i>Rain</span>
-        <span><i style="--legend-color:#7bd88f"></i>Wind avg</span>
-        <span><i style="--legend-color:#e879f9"></i>Gusts</span>
+        <span><i style="--legend-color:#e07b00"></i>Temp avg</span>
+        <span><i style="--legend-color:#0e7fcf"></i>Rain</span>
+        <span><i style="--legend-color:#1d9646"></i>Wind avg</span>
+        <span><i style="--legend-color:#a020bc"></i>Gusts</span>
       </div>
     </div>
     <div id="weather-chart" class="chart"></div>
@@ -1429,10 +1473,10 @@ function renderDashboard(d: DashboardData, includeLiveReload: boolean): string {
         <div id="history-status" class="status"></div>
       </div>
       <div class="legend">
-        <span><i style="--legend-color:#ffb454"></i>Temp avg</span>
-        <span><i style="--legend-color:#56c7ff"></i>Rain</span>
-        <span><i style="--legend-color:#7bd88f"></i>Wind avg</span>
-        <span><i style="--legend-color:#e879f9"></i>Gusts</span>
+        <span><i style="--legend-color:#e07b00"></i>Temp avg</span>
+        <span><i style="--legend-color:#0e7fcf"></i>Rain</span>
+        <span><i style="--legend-color:#1d9646"></i>Wind avg</span>
+        <span><i style="--legend-color:#a020bc"></i>Gusts</span>
       </div>
     </div>
     <form id="history-form" class="history-controls">
@@ -1519,25 +1563,25 @@ function renderDashboard(d: DashboardData, includeLiveReload: boolean): string {
       value == null ? 'N/A' : value.toFixed(digits).replace(/\\.0$/, '') + suffix;
     const createSeries = () => ([
       {},
-      { label: 'Temp low', scale: 'temp', stroke: '#ffb454', width: 1, points: { show: false } },
-      { label: 'Temp avg', scale: 'temp', stroke: '#ffb454', width: 3, points: { show: false } },
-      { label: 'Temp high', scale: 'temp', stroke: '#ffb454', width: 1, points: { show: false } },
+      { label: 'Temp low', scale: 'temp', stroke: '#e07b00', width: 1, points: { show: false } },
+      { label: 'Temp avg', scale: 'temp', stroke: '#e07b00', width: 3, points: { show: false } },
+      { label: 'Temp high', scale: 'temp', stroke: '#e07b00', width: 1, points: { show: false } },
       {
         label: 'Rain',
         scale: 'rain',
-        stroke: '#56c7ff',
-        fill: '#56c7ff66',
+        stroke: '#0e7fcf',
+        fill: '#0e7fcf66',
         width: 1,
         paths: uPlot.paths.bars({ size: [0.82, Infinity, 1], align: 0 }),
         points: { show: false },
       },
-      { label: 'Wind avg', scale: 'wind', stroke: '#7bd88f', width: 3, points: { show: false } },
-      { label: 'Gusts', scale: 'wind', stroke: '#e879f9', width: 3, dash: [8, 5], points: { show: false } },
+      { label: 'Wind avg', scale: 'wind', stroke: '#1d9646', width: 3, points: { show: false } },
+      { label: 'Gusts', scale: 'wind', stroke: '#a020bc', width: 3, dash: [8, 5], points: { show: false } },
     ]);
     const createAxes = (labelFormatter, rotate = 45, space = 56) => ([
       {
-        stroke: '#7f93a5',
-        grid: { stroke: '#26384d', width: 1 },
+        stroke: '#7d8b9b',
+        grid: { stroke: '#e6ecf3', width: 1 },
         values: (u, ticks) => ticks.map(labelFormatter),
         rotate,
         space,
@@ -1548,15 +1592,15 @@ function renderDashboard(d: DashboardData, includeLiveReload: boolean): string {
         scale: 'temp',
         label: 'F',
         size: 42,
-        stroke: '#ffb454',
-        grid: { stroke: '#26384d', width: 1 },
+        stroke: '#e07b00',
+        grid: { stroke: '#e6ecf3', width: 1 },
       },
       {
         scale: 'rain',
         label: 'in',
         side: 1,
         size: 42,
-        stroke: '#56c7ff',
+        stroke: '#0e7fcf',
         grid: { show: false },
       },
       {
@@ -1564,7 +1608,7 @@ function renderDashboard(d: DashboardData, includeLiveReload: boolean): string {
         label: 'mph',
         side: 1,
         size: 46,
-        stroke: '#b98cff',
+        stroke: '#7d8b9b',
         grid: { show: false },
       },
     ]);
@@ -1574,10 +1618,10 @@ function renderDashboard(d: DashboardData, includeLiveReload: boolean): string {
         if (!readout || idx == null || idx < 0) return;
         readout.innerHTML = [
           '<div>' + readoutLabelFormatter(x[idx]) + '</div>',
-          '<div>Temp <span style="--readout-color:#ffb454">' + fmtNumber(tempLow[idx], ' F') + '–' + fmtNumber(tempHigh[idx], ' F') + ' (avg ' + fmtNumber(tempAvg[idx], ' F') + ')</span></div>',
-          '<div>Rain <span style="--readout-color:#56c7ff">' + fmtNumber(rainfall[idx], ' in', 2) + '</span></div>',
-          '<div>Wind <span style="--readout-color:#7bd88f">' + fmtNumber(windAvg[idx], ' mph') + '</span></div>',
-          '<div>Gust <span style="--readout-color:#e879f9">' + fmtNumber(windGustHigh[idx], ' mph') + '</span></div>',
+          '<div>Temp <span style="--readout-color:#e07b00">' + fmtNumber(tempLow[idx], ' F') + '–' + fmtNumber(tempHigh[idx], ' F') + ' (avg ' + fmtNumber(tempAvg[idx], ' F') + ')</span></div>',
+          '<div>Rain <span style="--readout-color:#0e7fcf">' + fmtNumber(rainfall[idx], ' in', 2) + '</span></div>',
+          '<div>Wind <span style="--readout-color:#1d9646">' + fmtNumber(windAvg[idx], ' mph') + '</span></div>',
+          '<div>Gust <span style="--readout-color:#a020bc">' + fmtNumber(windGustHigh[idx], ' mph') + '</span></div>',
         ].join('');
       };
       const opts = {
@@ -1623,10 +1667,10 @@ function renderDashboard(d: DashboardData, includeLiveReload: boolean): string {
     if (!readout || idx == null || idx < 0) return;
     readout.innerHTML = [
       '<div>' + fmtDay(payload.x[idx]) + '</div>',
-      '<div>Temp <span style="--readout-color:#ffb454">' + fmtNumber(payload.temp[idx], ' F') + '</span></div>',
-      '<div>Rain <span style="--readout-color:#56c7ff">' + fmtNumber(payload.rainfall[idx], ' in', 2) + '</span></div>',
-      '<div>Wind <span style="--readout-color:#7bd88f">' + fmtNumber(payload.windAvg[idx], ' mph') + '</span></div>',
-      '<div>Gust <span style="--readout-color:#e879f9">' + fmtNumber(payload.windGustHigh[idx], ' mph') + '</span></div>',
+      '<div>Temp <span style="--readout-color:#e07b00">' + fmtNumber(payload.temp[idx], ' F') + '</span></div>',
+      '<div>Rain <span style="--readout-color:#0e7fcf">' + fmtNumber(payload.rainfall[idx], ' in', 2) + '</span></div>',
+      '<div>Wind <span style="--readout-color:#1d9646">' + fmtNumber(payload.windAvg[idx], ' mph') + '</span></div>',
+      '<div>Gust <span style="--readout-color:#a020bc">' + fmtNumber(payload.windGustHigh[idx], ' mph') + '</span></div>',
     ].join('');
   };
 
@@ -1651,8 +1695,8 @@ function renderDashboard(d: DashboardData, includeLiveReload: boolean): string {
     },
     axes: [
       {
-        stroke: '#7f93a5',
-        grid: { stroke: '#26384d', width: 1 },
+        stroke: '#7d8b9b',
+        grid: { stroke: '#e6ecf3', width: 1 },
         values: (u, ticks) => ticks.map(fmtDay),
         rotate: 45,
         space: 80,
@@ -1663,15 +1707,15 @@ function renderDashboard(d: DashboardData, includeLiveReload: boolean): string {
         scale: 'temp',
         label: 'F',
         size: 42,
-        stroke: '#ffb454',
-        grid: { stroke: '#26384d', width: 1 },
+        stroke: '#e07b00',
+        grid: { stroke: '#e6ecf3', width: 1 },
       },
       {
         scale: 'rain',
         label: 'in',
         side: 1,
         size: 42,
-        stroke: '#56c7ff',
+        stroke: '#0e7fcf',
         grid: { show: false },
       },
       {
@@ -1679,24 +1723,24 @@ function renderDashboard(d: DashboardData, includeLiveReload: boolean): string {
         label: 'mph',
         side: 1,
         size: 46,
-        stroke: '#b98cff',
+        stroke: '#7d8b9b',
         grid: { show: false },
       },
     ],
     series: [
       {},
-      { label: 'Temp', scale: 'temp', stroke: '#ffb454', width: 2, points: { show: false } },
+      { label: 'Temp', scale: 'temp', stroke: '#e07b00', width: 2, points: { show: false } },
       {
         label: 'Rain',
         scale: 'rain',
-        stroke: '#56c7ff',
-        fill: '#56c7ff66',
+        stroke: '#0e7fcf',
+        fill: '#0e7fcf66',
         width: 1,
         paths: uPlot.paths.bars({ size: [0.82, Infinity, 1], align: 0 }),
         points: { show: false },
       },
-      { label: 'Wind avg', scale: 'wind', stroke: '#7bd88f', width: 2, points: { show: false } },
-      { label: 'Gusts', scale: 'wind', stroke: '#e879f9', width: 2, dash: [8, 5], points: { show: false } },
+      { label: 'Wind avg', scale: 'wind', stroke: '#1d9646', width: 2, points: { show: false } },
+      { label: 'Gusts', scale: 'wind', stroke: '#a020bc', width: 2, dash: [8, 5], points: { show: false } },
     ],
   };
 
@@ -1920,6 +1964,75 @@ function fmtTempRange(day: DailyWeather | null | undefined): string {
 	return `${fmtNumber(day.tempLow, ' F')} / ${fmtNumber(day.tempHigh, ' F')}`;
 }
 
+
+function renderHomePage(stationIds: string[]): string {
+	const links = stationIds.map((id) =>
+		'<li><a href="/pws/' + escHtml(id) + '/dashboard">' + escHtml(id) + '</a></li>'
+	).join('');
+
+	return `<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Weather Stations</title>
+<link rel="stylesheet" href="/vendor/leaflet/leaflet.css">
+<script src="/vendor/leaflet/leaflet.js"></script>
+<style>
+  *, *::before, *::after { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f7f9fc; color: #1a1f2c; }
+  .wrap { max-width: 1100px; margin: 0 auto; padding: 24px; }
+  h1 { color: #1a1f2c; margin: 0 0 16px; }
+  a { color: #0e7fcf; text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  ul { line-height: 2; }
+  .empty { color: #5a6878; }
+  #map { height: 60vh; min-height: 420px; width: 100%; border-radius: 8px; background: #eef2f7; }
+  .leaflet-container { background: #eef2f7; }
+  .leaflet-popup-content a { color: #1a6fd6; }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Weather Dashboard</h1>
+    <div id="map"></div>
+    <p>Select a Personal Weather Station:</p>
+    ${stationIds.length ? '<ul>' + links + '</ul>' : '<p class="empty">No stations configured. Set WU_STATION_IDS.</p>'}
+  </div>
+<script>
+(async function () {
+  const el = document.getElementById('map');
+  if (!el || typeof L === 'undefined') return;
+  const map = L.map(el, { zoomControl: true, attributionControl: true });
+  L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', {
+    maxZoom: 19,
+    subdomains: 'abcd',
+    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a> &copy; <a href="https://carto.com/attributions">CARTO</a>',
+  }).addTo(map);
+  map.setView([39.5, -98.35], 4);
+  try {
+    const res = await fetch('/api/stations/coords');
+    const stations = await res.json();
+    if (!Array.isArray(stations) || stations.length === 0) return;
+    const markers = stations.map((s) =>
+      L.marker([s.lat, s.lon])
+        .bindPopup('<strong>' + s.id + '</strong><br><a href="/pws/' + encodeURIComponent(s.id) + '/dashboard">Dashboard</a>')
+        .addTo(map),
+    );
+    if (markers.length === 1) {
+      map.setView(markers[0].getLatLng(), 11);
+    } else {
+      const group = L.featureGroup(markers);
+      map.fitBounds(group.getBounds(), { padding: [40, 40] });
+    }
+  } catch (err) {
+    console.error('Failed to load station coords', err);
+  }
+})();
+</script>
+</body>
+</html>`;
+}
+
 function fmtPrettyDate(ymd: string): string {
 	const [y, m, d] = ymd.split('-').map(Number);
 	const date = new Date(Date.UTC(y, m - 1, d));
@@ -1930,33 +2043,6 @@ function fmtPrettyDate(ymd: string): string {
 		day: 'numeric',
 		timeZone: 'UTC',
 	});
-}
-
-function renderHomePage(stationIds: string[]): string {
-	const links = stationIds.map((id) =>
-		'<li><a href="/pws/' + escHtml(id) + '/dashboard">' + escHtml(id) + '</a> — <a href="/pws/' + escHtml(id) + '/rain-yesterday">yesterday\'s rain</a></li>'
-	).join('');
-
-	return `<!DOCTYPE html>
-<html lang="en">
-<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Weather Stations</title>
-<style>
-  *, *::before, *::after { box-sizing: border-box; }
-  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #08111d; color: #e9eef4; padding: 24px; max-width: 800px; margin: 0 auto; }
-  h1 { color: #f4f8fb; }
-  a { color: #56c7ff; text-decoration: none; }
-  a:hover { text-decoration: underline; }
-  ul { line-height: 2; }
-  .empty { color: #94a8b8; }
-</style>
-</head>
-<body>
-  <h1>Weather Dashboard</h1>
-  <p>Select a Personal Weather Station:</p>
-  ${stationIds.length ? '<ul>' + links + '</ul>' : '<p class="empty">No stations configured. Set WU_STATION_IDS.</p>'}
-</body>
-</html>`;
 }
 
 function renderYesterdayRain(d: DashboardData): string {
@@ -1976,66 +2062,40 @@ function renderYesterdayRain(d: DashboardData): string {
   body {
     margin: 0;
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-    background: #08111d;
-    color: #e9eef4;
+    background: #f7f9fc;
+    color: #1a1f2c;
     min-height: 100vh;
     display: flex;
     align-items: center;
     justify-content: center;
     padding: 24px;
   }
-  main {
-    text-align: center;
-    max-width: 600px;
-  }
+  main { text-align: center; max-width: 600px; }
   h1 {
     margin: 0 0 8px;
     font-size: clamp(1.2rem, 3vw, 1.6rem);
     font-weight: 400;
-    color: #94a8b8;
+    color: #5a6878;
   }
   .date {
-    color: #dce8ef;
+    color: #1a1f2c;
     font-size: clamp(1rem, 2.5vw, 1.4rem);
     margin-bottom: 8px;
   }
   .answer {
     font-size: clamp(3rem, 10vw, 6rem);
     font-weight: 700;
-    color: #56c7ff;
+    color: #0e7fcf;
     line-height: 1.1;
     margin: 16px 0 4px;
   }
-  .unit {
-    color: #94a8b8;
-    font-size: clamp(1rem, 2.5vw, 1.4rem);
-    margin-bottom: 8px;
-  }
-  .none {
-    color: #94a8b8;
-    font-size: clamp(2rem, 6vw, 3.5rem);
-    font-weight: 600;
-    margin: 16px 0;
-  }
-  .meta {
-    color: #94a8b8;
-    font-size: .9rem;
-    margin-top: 24px;
-    line-height: 1.6;
-  }
-  .meta a {
-    color: #56c7ff;
-    text-decoration: none;
-  }
-  .meta a:hover {
-    text-decoration: underline;
-  }
-  .warning {
-    color: #f2d27a;
-  }
-  @media (max-width: 500px) {
-    body { padding: 16px; }
-  }
+  .unit { color: #5a6878; font-size: clamp(1rem, 2.5vw, 1.4rem); margin-bottom: 8px; }
+  .none { color: #5a6878; font-size: clamp(2rem, 6vw, 3.5rem); font-weight: 600; margin: 16px 0; }
+  .meta { color: #5a6878; font-size: .9rem; margin-top: 24px; line-height: 1.6; }
+  .meta a { color: #0e7fcf; text-decoration: none; }
+  .meta a:hover { text-decoration: underline; }
+  .warning { color: #7a5a00; }
+  @media (max-width: 500px) { body { padding: 16px; } }
 </style>
 </head>
 <body>

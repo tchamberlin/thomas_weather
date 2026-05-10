@@ -19,6 +19,8 @@
     "wrangler": "^4.90.0"
   },
   "dependencies": {
+    "@types/leaflet": "^1.9.21",
+    "leaflet": "^1.9.4",
     "uplot": "^1.6.32"
   }
 }
