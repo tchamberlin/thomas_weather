@@ -168,3 +168,5 @@ dist
 .dev.vars
 test-local.mjs
 data/wunderground/
+qr-codes/
+qr-test/
