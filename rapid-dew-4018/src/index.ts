@@ -156,8 +156,10 @@ const HISTORY_BLOCK_DAYS = 31;
 
 export default {
 	async scheduled(_event: ScheduledController, env: Env, _ctx: ExecutionContext): Promise<void> {
+		console.log('[cron] scheduled run started');
 		await refreshDailySummaryCache(env);
 		await refreshRecentHistory(env);
+		console.log('[cron] scheduled run completed');
 	},
 
 	async fetch(req: Request, env: Env): Promise<Response> {
@@ -255,10 +257,13 @@ function getCron15Times(now: Date = new Date()): { last: string; next: string } 
 		next.setUTCHours(next.getUTCHours() + 1, 0, 0, 0);
 	}
 
-	return { last: last.toISOString(), next: next.toISOString() };
+	const result = { last: last.toISOString(), next: next.toISOString() };
+	console.log('[cron] getCron15Times:', result);
+	return result;
 }
 
 async function buildDashboard(env: Env): Promise<DashboardData> {
+	console.log('[dashboard] buildDashboard started');
 	const [dailyResult, currentResult, historyIndex, hourly7Day] = await Promise.all([
 		loadDailySummaries(env),
 		loadCurrent(env),
@@ -274,6 +279,7 @@ async function buildDashboard(env: Env): Promise<DashboardData> {
 	const yesterday = todayDate ? findPreviousDay(recentDays, todayDate) : recentDays.at(-2) ?? null;
 	const lastReading = current?.obsTimeLocal ?? current?.obsTimeUtc ?? recentDays.at(-1)?.obsTimeLocal ?? 'N/A';
 	const { last: lastScheduledRun, next: nextScheduledRun } = getCron15Times();
+	console.log('[dashboard] nextScheduledRun:', nextScheduledRun);
 
 	return {
 		stationId: env.WU_STATION_ID,
@@ -1410,6 +1416,7 @@ function renderDashboard(d: DashboardData, includeLiveReload: boolean): string {
 (function() {
   const staleEl = document.getElementById('stale-timer');
   const nextEl = document.getElementById('schedule-countdown');
+  console.log('[client] countdown init, nextRun:', nextEl?.dataset.nextRun);
 
   function fmt(m, s) {
     return m + ':' + (s < 10 ? '0' : '') + s;
@@ -1434,6 +1441,7 @@ function renderDashboard(d: DashboardData, includeLiveReload: boolean): string {
         nextEl.classList.add('overdue');
         if (!nextEl.dataset.reloadScheduled) {
           nextEl.dataset.reloadScheduled = '1';
+          console.log('[client] countdown overdue, scheduling reload in 20s');
           setTimeout(() => location.reload(), 20000);
         }
       } else {
