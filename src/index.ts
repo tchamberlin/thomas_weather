@@ -138,6 +138,7 @@ interface DailyWeather {
 	pressureMax: number | null;
 	pressureMin: number | null;
 	records?: number;
+	tz?: string;
 	source: 'historical' | 'history' | 'cache';
 }
 
@@ -383,7 +384,7 @@ async function buildDashboard(env: Env, stationId: string): Promise<DashboardDat
 		nextScheduledRun,
 		dataSource: dailyResult.source,
 		warning: joinWarnings(dailyResult.warning, currentResult.warning),
-		timezone: current?.tz ?? null,
+		timezone: current?.tz ?? recentDays.findLast((d) => !!d.tz)?.tz ?? null,
 	};
 }
 
@@ -978,14 +979,14 @@ async function loadDailySummaries(env: Env, stationId: string): Promise<{ days: 
 	try {
 		const days = await fetchDailySummaries(env, stationId);
 		await cacheDailySummaries(env, stationId, days);
-		return { days, source: 'Weather Company daily summary', warning: null };
+		return { days, source: 'wunderground.com /v2/pws/dailysummary/7day', warning: null };
 	} catch (err: unknown) {
 		const cachedDays = await readCachedDailySummaries(env, stationId);
 		if (cachedDays.length > 0) {
 			const msg = err instanceof Error ? err.message : String(err);
 			return {
 				days: cachedDays,
-				source: 'Cached Weather Company daily summary',
+				source: 'KV cache (wunderground.com /v2/pws/dailysummary/7day)',
 				warning: `Historical API unavailable; showing cached data. ${msg}`,
 			};
 		}
@@ -1038,6 +1039,7 @@ function normalizeDailySummary(summary: WUDailySummary, source: DailyWeather['so
 		windGustHigh: numberOrNull(imperial.windgustHigh),
 		pressureMax: numberOrNull(imperial.pressureMax),
 		pressureMin: numberOrNull(imperial.pressureMin),
+		tz: summary.tz,
 		source,
 	};
 }
@@ -1059,6 +1061,7 @@ function normalizeCachedDay(value: unknown): DailyWeather | null {
 		windGustHigh: numberOrNull(day.windGustHigh),
 		pressureMax: numberOrNull(day.pressureMax),
 		pressureMin: numberOrNull(day.pressureMin),
+		tz: typeof day.tz === 'string' ? day.tz : undefined,
 		source: 'cache',
 	};
 }
@@ -2176,7 +2179,7 @@ function renderRainPage(
 	neighborRain: NeighborRainReading[] = [],
 ): string {
 	const prettyDate = fmtPrettyDate(target.date);
-	const tz = d.timezone ?? 'local time';
+	const tz = d.timezone;
 	const heading = target.isToday
 		? 'How much has it rained today?'
 		: target.isYesterday
@@ -2286,7 +2289,7 @@ function renderRainPage(
   }
   ${comparisonBlock}
   <div class="meta">
-    Timezone: ${escHtml(tz)}<br>
+    ${tz ? `Timezone: ${escHtml(tz)}<br>` : ''}
     Source: ${escHtml(d.dataSource)}${d.warning ? `<br><span class="warning">${escHtml(d.warning)}</span>` : ''}<br>
     <a href="/pws/${escHtml(d.stationId)}/dashboard">Full dashboard →</a>
   </div>
