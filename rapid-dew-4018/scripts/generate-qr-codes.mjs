@@ -70,11 +70,11 @@ async function resolveBaseUrl(args) {
     return envUrl.replace(/\/$/, '');
   }
 
-  // Priority 3: .dev.vars CUSTOM_DOMAIN
+  // Priority 3: .dev.vars DEPLOYED_URL
   const devVars = await readDevVars('.dev.vars');
-  if (devVars.CUSTOM_DOMAIN) {
-    const url = devVars.CUSTOM_DOMAIN.replace(/\/$/, '');
-    console.error(`Using CUSTOM_DOMAIN from .dev.vars: ${url}`);
+  if (devVars.DEPLOYED_URL) {
+    const url = normalizeUrl(devVars.DEPLOYED_URL);
+    console.error(`Using DEPLOYED_URL from .dev.vars: ${url}`);
     return url;
   }
 
@@ -89,7 +89,7 @@ async function resolveBaseUrl(args) {
   const configUrl = await inferUrlFromWranglerConfig();
   if (configUrl) {
     console.error(`Inferred URL from wrangler.jsonc: ${configUrl}`);
-    console.error(`Tip: Add CUSTOM_DOMAIN=https://your-domain.com to .dev.vars to override.`);
+    console.error(`Tip: Add DEPLOYED_URL=your-domain.com to .dev.vars to override.`);
     return configUrl;
   }
 
@@ -294,6 +294,12 @@ function parseArgs(argv) {
   return parsed;
 }
 
+function normalizeUrl(value) {
+  const trimmed = value.trim().replace(/\/$/, '');
+  if (/^https?:\/\//i.test(trimmed)) return trimmed;
+  return `https://${trimmed}`;
+}
+
 function toCamel(value) {
   return value.replace(/-([a-z])/g, (_, letter) => letter.toUpperCase());
 }
@@ -346,7 +352,7 @@ Generate QR codes for each public page in the app.
 Auto-detects the production URL in this order:
   1. --base-url argument
   2. QR_BASE_URL env var
-  3. CUSTOM_DOMAIN in .dev.vars
+  3. DEPLOYED_URL in .dev.vars (bare domain, https:// prepended automatically)
   4. wrangler deployments list (requires local Cloudflare auth)
   5. wrangler.jsonc name → https://<name>.workers.dev
 
