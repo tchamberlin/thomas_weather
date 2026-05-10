@@ -3,31 +3,38 @@
  * https://developers.cloudflare.com/workers/wrangler/configuration/
  */
 {
-  "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "rapid-dew-4018",
-  "main": "src/index.ts",
-  "compatibility_date": "2026-05-10",
-  "observability": {
-    "enabled": true
-  },
-  "triggers": {
-    "crons": [
-      "*/15 * * * *"
-    ]
-  },
-  "upload_source_maps": true,
-  "compatibility_flags": [
-    "nodejs_compat"
-  ],
-  "kv_namespaces": [
-    {
-      "binding": "RAINFALL",
-      "id": "<paste-your-kv-namespace-id-here>"
-    }
-  ]
-  /**
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "rapid-dew-4018",
+	"main": "src/index.ts",
+	"compatibility_date": "2026-05-10",
+	"observability": {
+		"enabled": true
+	},
+	"assets": {
+		"directory": "./public",
+		"binding": "ASSETS",
+		"not_found_handling": "none",
+		"run_worker_first": true
+	},
+	"triggers": {
+		"crons": [
+			"*/15 * * * *"
+		]
+	},
+	"upload_source_maps": true,
+	"compatibility_flags": [
+		"nodejs_compat"
+	],
+	"kv_namespaces": [
+		{
+			"binding": "WEATHER",
+			"id": "2f1afba1ef434b54ad79c54d2e8f6c85"
+		}
+	]
+	/**
    * Secrets (set via `npx wrangler secret put <NAME>`):
    *   WU_API_KEY       — Weather Underground API key
    *   WU_STATION_ID    — PWS station ID
+   *   BACKFILL_TOKEN   — bearer/query token for admin history backfill endpoints
    */
 }

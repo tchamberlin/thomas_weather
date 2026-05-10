@@ -167,3 +167,4 @@ dist
 .wrangler/
 .dev.vars
 test-local.mjs
+data/wunderground/
