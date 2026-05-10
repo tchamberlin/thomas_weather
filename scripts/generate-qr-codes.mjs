@@ -103,8 +103,8 @@ async function fetchWranglerDeploymentUrl() {
       { timeout: 15000, cwd: process.cwd() }
     );
     // Match patterns like:
-    // https://rapid-dew-4018.abc123.workers.dev
-    // https://rapid-dew-4018.pages.dev
+    // https://weather.abc123.workers.dev
+    // https://weather.pages.dev
     const match = stdout.match(/https:\/\/[^\s\n]+\.(?:workers\.dev|pages\.dev)/);
     if (match) {
       return match[0].replace(/\/$/, '');
