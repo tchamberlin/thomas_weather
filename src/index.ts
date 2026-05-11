@@ -10,7 +10,9 @@
  *   WU_STATION_IDS  - Comma-separated PWS station IDs (e.g. "KVALAKEF29,KFOO")
  *
  * Routes:
- *   /                          - Station index (placeholder)
+ *   /[?pws=K1,K2]              - Station index (placeholder when no pws param)
+ *   /rain[/<spec>]?pws=K1,K2   - Rain page for the listed stations
+ *   /api/stations/coords?pws=K1,K2 - Coords JSON for the listed stations
  *   /pws/<stationId>           - Redirects to /pws/<stationId>/dashboard
  *   /pws/<stationId>/dashboard            - Per-station dashboard
  *   /pws/<stationId>/rain[/<spec>]        - Rainfall page; spec ∈ today (default) | yesterday | YYYY-MM-DD
@@ -209,9 +211,9 @@ export default {
 			return env.ASSETS.fetch(req);
 		}
 
-		// New home page (placeholder)
+		// Home page — placeholder unless ?pws=K1,K2 supplied
 		if (url.pathname === '/') {
-			const stationIds = getStationIds(env);
+			const stationIds = parsePwsParam(url.searchParams.get('pws'));
 			return new Response(renderHomePage(stationIds), {
 				headers: { 'Content-Type': 'text/html; charset=utf-8' },
 			});
@@ -223,13 +225,13 @@ export default {
 			return Response.redirect(`${url.origin}/pws/${pwsBareMatch[1]}/dashboard`, 302);
 		}
 
-		// /rain[/<spec>]   all primary stations on one page
+		// /rain[/<spec>]?pws=K1,K2   all listed stations on one page
 		const allRainMatch = /^\/rain(?:\/([^/]+))?\/?$/.exec(url.pathname);
 		if (allRainMatch) {
 			const spec = allRainMatch[1] ? decodeURIComponent(allRainMatch[1]) : 'today';
-			const stationIds = getStationIds(env);
+			const stationIds = parsePwsParam(url.searchParams.get('pws'));
 			if (stationIds.length === 0) {
-				return new Response('No stations configured.', { status: 404 });
+				return new Response('Missing ?pws=K1,K2 query parameter.', { status: 400 });
 			}
 			const { WU_API_KEY } = weatherConfig(env);
 			if (!WU_API_KEY) {
@@ -317,7 +319,14 @@ export default {
 
 		// API routes
 		if (url.pathname === '/api/stations/coords') {
-			const coords = await getAllStationCoords(env);
+			const stationIds = parsePwsParam(url.searchParams.get('pws'));
+			if (stationIds.length === 0) {
+				return new Response(JSON.stringify({ error: 'Missing ?pws=K1,K2 query parameter.' }), {
+					status: 400,
+					headers: { 'Content-Type': 'application/json' },
+				});
+			}
+			const coords = await getStationCoordsList(env, stationIds);
 			return new Response(JSON.stringify(coords), {
 				headers: { 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=300' },
 			});
@@ -640,10 +649,26 @@ async function getStationCoords(env: Env, stationId: string): Promise<StationCoo
 	return null;
 }
 
-async function getAllStationCoords(env: Env): Promise<StationCoords[]> {
-	const ids = getStationIds(env);
-	const results = await Promise.all(ids.map((id) => getStationCoords(env, id)));
+async function getStationCoordsList(env: Env, stationIds: string[]): Promise<StationCoords[]> {
+	const results = await Promise.all(stationIds.map((id) => getStationCoords(env, id)));
 	return results.filter((c): c is StationCoords => c !== null);
+}
+
+const PWS_ID_RE = /^[A-Za-z0-9]{3,32}$/;
+function parsePwsParam(raw: string | null): string[] {
+	if (!raw) return [];
+	const seen = new Set<string>();
+	const out: string[] = [];
+	for (const piece of raw.split(',')) {
+		const trimmed = piece.trim();
+		if (!trimmed || !PWS_ID_RE.test(trimmed)) continue;
+		const upper = trimmed.toUpperCase();
+		if (seen.has(upper)) continue;
+		seen.add(upper);
+		out.push(upper);
+		if (out.length >= 32) break;
+	}
+	return out;
 }
 
 
@@ -2143,10 +2168,14 @@ const STATION_MAP_STYLES = `#map { height: 60vh; min-height: 420px; width: 100%;
 .leaflet-container { background: #eef2f7; }
 .leaflet-popup-content a { color: #1a6fd6; }`;
 
-const STATION_MAP_INIT_SCRIPT = `<script>
+function stationMapInitScript(stationIds: string[]): string {
+	const idsJson = safeScriptJson(stationIds);
+	return `<script>
 (async function () {
   const el = document.getElementById('map');
   if (!el || typeof L === 'undefined') return;
+  const ids = ${idsJson};
+  if (!Array.isArray(ids) || ids.length === 0) return;
   const map = L.map(el, { zoomControl: true, attributionControl: true });
   L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', {
     maxZoom: 19,
@@ -2155,7 +2184,7 @@ const STATION_MAP_INIT_SCRIPT = `<script>
   }).addTo(map);
   map.setView([39.5, -98.35], 4);
   try {
-    const res = await fetch('/api/stations/coords');
+    const res = await fetch('/api/stations/coords?pws=' + encodeURIComponent(ids.join(',')));
     const stations = await res.json();
     if (!Array.isArray(stations) || stations.length === 0) return;
     const markers = stations.map((s) =>
@@ -2174,17 +2203,29 @@ const STATION_MAP_INIT_SCRIPT = `<script>
   }
 })();
 </script>`;
+}
 
 function renderHomePage(stationIds: string[]): string {
+	const hasIds = stationIds.length > 0;
 	const links = stationIds.map((id) =>
 		'<li><a href="/pws/' + escHtml(id) + '/dashboard">' + escHtml(id) + '</a></li>'
 	).join('');
+	const pwsParam = encodeURIComponent(stationIds.join(','));
+	const rainLinks = hasIds
+		? `<p><a href="/rain/today?pws=${pwsParam}">Rain — listed stations (today)</a> · <a href="/rain/yesterday?pws=${pwsParam}">yesterday</a></p>`
+		: '';
+	const body = hasIds
+		? `<div id="map"></div>
+    ${rainLinks}
+    <p>Personal Weather Stations:</p>
+    <ul>${links}</ul>`
+		: `<p class="empty">Append <code>?pws=K1,K2,K3</code> to view dashboards for one or more PWS station IDs, or visit <code>/pws/&lt;id&gt;/dashboard</code> directly.</p>`;
 
 	return `<!DOCTYPE html>
 <html lang="en">
 <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Weather Stations</title>
-${STATION_MAP_HEAD}
+${hasIds ? STATION_MAP_HEAD : ''}
 <style>
   *, *::before, *::after { box-sizing: border-box; }
   html, body { margin: 0; padding: 0; }
@@ -2194,19 +2235,17 @@ ${STATION_MAP_HEAD}
   a { color: #0e7fcf; text-decoration: none; }
   a:hover { text-decoration: underline; }
   ul { line-height: 2; }
+  code { background: #eef2f7; padding: 2px 6px; border-radius: 4px; }
   .empty { color: #5a6878; }
-  ${STATION_MAP_STYLES}
+  ${hasIds ? STATION_MAP_STYLES : ''}
 </style>
 </head>
 <body>
   <div class="wrap">
     <h1>Weather Dashboard</h1>
-    <div id="map"></div>
-    <p><a href="/rain/today">Rain — all stations (today)</a> · <a href="/rain/yesterday">yesterday</a></p>
-    <p>Select a Personal Weather Station:</p>
-    ${stationIds.length ? '<ul>' + links + '</ul>' : '<p class="empty">No stations configured. Set WU_STATION_IDS.</p>'}
+    ${body}
   </div>
-${STATION_MAP_INIT_SCRIPT}
+${hasIds ? stationMapInitScript(stationIds) : ''}
 </body>
 </html>`;
 }
