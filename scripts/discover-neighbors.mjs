@@ -3,13 +3,16 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import process from 'node:process';
+import { spawn } from 'node:child_process';
 
 const API_BASE = 'https://api.weather.com';
+const STATION_IDS_KV_KEY = 'weather:config:station-ids';
 
 const args = parseArgs(process.argv.slice(2));
 const dotEnv = await readDevVars(args.env ?? '.dev.vars');
 const apiKey = cleanSecret(args.apiKey ?? process.env.WU_API_KEY ?? dotEnv.WU_API_KEY);
-const stationsArg = cleanSecret(args.stations ?? process.env.WU_STATION_IDS ?? dotEnv.WU_STATION_IDS);
+const kvScope = args.kvRemote ? 'remote' : 'local';
+const stationsArg = cleanSecret(args.stations) || await readStationIdsFromKv(kvScope);
 const outPath = args.out ?? 'data/neighbors.json';
 const maxDistanceMi = args.maxDistanceMi === undefined ? null : Number(args.maxDistanceMi);
 const includeSelf = args.includeSelf === '1';
@@ -22,7 +25,7 @@ if (args.help) {
 }
 
 if (!apiKey) fail('Missing WU_API_KEY. Set env var or .dev.vars.');
-if (!stationsArg) fail('Missing stations. Pass --stations or set WU_STATION_IDS.');
+if (!stationsArg) fail(`Missing stations. Pass --stations or seed KV key ${STATION_IDS_KV_KEY} via npm run add-station.`);
 
 const primaries = stationsArg.split(',').map((s) => s.trim()).filter(Boolean);
 if (primaries.length === 0) fail('No primary stations parsed from input.');
@@ -182,6 +185,27 @@ function sleep(ms) {
 	return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+async function readStationIdsFromKv(scope, binding = 'WEATHER') {
+	const scopeArg = scope === 'remote' ? '--remote' : '--local';
+	const result = await new Promise((resolve) => {
+		const child = spawn(process.platform === 'win32' ? 'npx.cmd' : 'npx', ['wrangler', 'kv', 'key', 'get', STATION_IDS_KV_KEY, '--binding', binding, scopeArg], {
+			cwd: process.cwd(),
+			env: { ...process.env, XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME ?? path.join(process.cwd(), '.wrangler-config') },
+			stdio: ['ignore', 'pipe', 'pipe'],
+		});
+		let stdout = '';
+		let stderr = '';
+		child.stdout.on('data', (c) => { stdout += c; });
+		child.stderr.on('data', (c) => { stderr += c; });
+		child.on('close', (code) => resolve({ code: code ?? 1, stdout, stderr }));
+	});
+	const stdout = (result.stdout || '').trim();
+	const combined = `${stdout}\n${result.stderr || ''}`.toLowerCase();
+	if (/value not found|key .* does not exist|key not found/.test(combined)) return '';
+	if (result.code !== 0) return '';
+	return stdout;
+}
+
 function fail(message) {
 	console.error(`Error: ${message}`);
 	process.exit(1);
@@ -194,7 +218,8 @@ Discovers nearby Weather Underground PWS for each primary station and writes
 a cached neighbor map to data/neighbors.json.
 
 Options:
-  --stations <ids>       Comma-separated primary station IDs (default: WU_STATION_IDS)
+  --stations <ids>       Comma-separated primary station IDs (default: read from KV weather:config:station-ids)
+  --kv-remote            Read station IDs from remote KV instead of local (default: local)
   --out <path>           Output JSON path (default: data/neighbors.json)
   --max-distance-mi <n>  Filter neighbors farther than this distance
   --include-self         Keep the primary station itself in its neighbor list

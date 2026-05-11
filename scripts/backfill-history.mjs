@@ -63,7 +63,8 @@ let emptyBlocks = 0;
 console.log(`Station: ${stationId}`);
 console.log(`Endpoint: /v2/pws/history/${endpoint}`);
 console.log(`Output: ${outputRoot()}`);
-console.log(`Mode: ${direction}${startDate ? ` ${startDate}..${endDate}` : ` from ${endDate} backward until empty/error`}`);
+const blockLimitLabel = Number.isFinite(maxBlocks) ? `up to ${maxBlocks} block${maxBlocks === 1 ? '' : 's'} (~${maxBlocks * MAX_RANGE_DAYS} days)` : 'until empty/error';
+console.log(`Mode: ${direction}${startDate ? ` ${startDate}..${endDate}` : ` from ${endDate}`} (${blockLimitLabel})`);
 console.log('');
 
 if (direction === 'forward') {

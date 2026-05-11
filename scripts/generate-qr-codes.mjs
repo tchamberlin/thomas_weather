@@ -9,9 +9,11 @@ import QRCode from 'qrcode';
 
 const execAsync = promisify(exec);
 
+const STATION_IDS_KV_KEY = 'weather:config:station-ids';
+
 /**
  * Per-station question routes: slug → display title above the QR code.
- * Routes are generated for every station in WU_STATION_IDS.
+ * Routes are generated for every station listed in KV weather:config:station-ids.
  * Add new entries here as the app grows more pages.
  */
 const QUESTIONS = [
@@ -19,14 +21,24 @@ const QUESTIONS = [
   { path: 'rain/yesterday', slug: 'rain-yesterday', title: 'How much rain did we get yesterday?' },
 ];
 
-async function buildRoutes() {
-  const devVars = await readDevVars('.dev.vars');
-  const raw = process.env.WU_STATION_IDS ?? devVars.WU_STATION_IDS ?? '';
+/**
+ * Site-wide routes (not tied to a specific station).
+ */
+const SITE_ROUTES = [
+  { path: '/', slug: 'home', title: 'Weather — Home' },
+  { path: '/rain/yesterday', slug: 'rain-yesterday-all', title: 'How much rain did we get yesterday? (all stations)' },
+];
+
+async function buildRoutes(kvScope) {
+  const raw = await readStationIdsFromKv(kvScope);
   const stationIds = raw.split(',').map((s) => s.trim()).filter(Boolean);
   if (stationIds.length === 0) {
-    fail('No stations configured. Set WU_STATION_IDS (comma-separated) in env or .dev.vars.');
+    fail(`No stations found in KV (${STATION_IDS_KV_KEY}). Add one via: npm run add-station -- --station <id>`);
   }
   const routes = [];
+  for (const site of SITE_ROUTES) {
+    routes.push({ path: site.path, title: site.title, slug: site.slug });
+  }
   for (const stationId of stationIds) {
     for (const q of QUESTIONS) {
       routes.push({
@@ -66,7 +78,8 @@ const shouldOpen = args.open === '1';
 
 await mkdir(outDir, { recursive: true });
 
-const routes = await buildRoutes();
+const kvScope = args.kvRemote ? 'remote' : 'local';
+const routes = await buildRoutes(kvScope);
 
 let outputPath;
 if (format === 'html') {
@@ -323,6 +336,27 @@ function toCamel(value) {
 function fail(message) {
   console.error(`Error: ${message}`);
   process.exit(1);
+}
+
+async function readStationIdsFromKv(scope, binding = 'WEATHER') {
+  const scopeArg = scope === 'remote' ? '--remote' : '--local';
+  const result = await new Promise((resolve) => {
+    const child = spawn(process.platform === 'win32' ? 'npx.cmd' : 'npx', ['wrangler', 'kv', 'key', 'get', STATION_IDS_KV_KEY, '--binding', binding, scopeArg], {
+      cwd: process.cwd(),
+      env: { ...process.env, XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME ?? path.join(process.cwd(), '.wrangler-config') },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (c) => { stdout += c; });
+    child.stderr.on('data', (c) => { stderr += c; });
+    child.on('close', (code) => resolve({ code: code ?? 1, stdout, stderr }));
+  });
+  const stdout = (result.stdout || '').trim();
+  const combined = `${stdout}\n${result.stderr || ''}`.toLowerCase();
+  if (/value not found|key .* does not exist|key not found/.test(combined)) return '';
+  if (result.code !== 0) return '';
+  return stdout;
 }
 
 async function readDevVars(filePath) {

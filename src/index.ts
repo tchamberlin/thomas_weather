@@ -7,7 +7,7 @@
  *
  * Config via secrets (set with `npx wrangler secret put <NAME>`):
  *   WU_API_KEY      - Weather Underground API key
- *   WU_STATION_IDS  - Comma-separated PWS station IDs (e.g. "KVALAKEF29,KFOO")
+ *   (station IDs live in KV under `weather:config:station-ids`, managed via `npm run add-station`)
  *
  * Routes:
  *   /[?pws=K1,K2]              - Station index (placeholder when no pws param)
@@ -193,7 +193,7 @@ const HISTORY_BLOCK_DAYS = 31;
 export default {
 	async scheduled(_event: ScheduledController, env: Env, _ctx: ExecutionContext): Promise<void> {
 		console.log('[cron] scheduled run started');
-		const stationIds = getStationIds(env);
+		const stationIds = await getStationIds(env);
 		for (const stationId of stationIds) {
 			await refreshDailySummaryCache(env, stationId);
 			await refreshRecentHistory(env, stationId);
@@ -265,7 +265,7 @@ export default {
 		if (pwsRainMatch) {
 			const stationId = decodeURIComponent(pwsRainMatch[1]);
 			const spec = pwsRainMatch[2] ? decodeURIComponent(pwsRainMatch[2]) : 'today';
-			if (!isValidStation(env, stationId)) {
+			if (!(await isValidStation(env, stationId))) {
 				return new Response('Station not found.', { status: 404 });
 			}
 			const { WU_API_KEY } = weatherConfig(env);
@@ -295,7 +295,7 @@ export default {
 		if (pwsQMatch) {
 			const stationId = decodeURIComponent(pwsQMatch[1]);
 			const question = pwsQMatch[2];
-			if (!isValidStation(env, stationId)) {
+			if (!(await isValidStation(env, stationId))) {
 				return new Response('Station not found.', { status: 404 });
 			}
 			const { WU_API_KEY } = weatherConfig(env);
@@ -341,7 +341,7 @@ export default {
 			const auth = authorizeAdmin(req, env);
 			if (auth) return auth;
 			const urlObj = new URL(req.url);
-			const stationId = urlObj.searchParams.get('stationId') ?? getDefaultStation(env);
+			const stationId = urlObj.searchParams.get('stationId') ?? (await getDefaultStation(env));
 			if (!stationId) {
 				return jsonResponse({ error: 'Missing stationId query parameter.' }, 400);
 			}
@@ -593,16 +593,24 @@ function weatherConfig(env: Env): { WU_API_KEY: string } {
 		WU_API_KEY: cleanSecret(env.WU_API_KEY),
 	};
 }
-function getStationIds(env: Env): string[] {
-	return cleanSecret(env.WU_STATION_IDS).split(',').map((s) => s.trim()).filter(Boolean);
+const STATION_IDS_KV_KEY = 'weather:config:station-ids';
+
+function parseStationIdList(raw: string): string[] {
+	return raw.split(',').map((s) => s.trim()).filter(Boolean);
 }
 
-function getDefaultStation(env: Env): string | undefined {
-	return getStationIds(env)[0];
+async function getStationIds(env: Env): Promise<string[]> {
+	const fromKv = await env.WEATHER.get(STATION_IDS_KV_KEY);
+	if (!fromKv) return [];
+	return parseStationIdList(cleanSecret(fromKv));
 }
 
-function isValidStation(env: Env, stationId: string): boolean {
-	return getStationIds(env).includes(stationId);
+async function getDefaultStation(env: Env): Promise<string | undefined> {
+	return (await getStationIds(env))[0];
+}
+
+async function isValidStation(env: Env, stationId: string): Promise<boolean> {
+	return (await getStationIds(env)).includes(stationId);
 }
 
 function isKnownNeighbor(stationId: string): boolean {
@@ -613,8 +621,8 @@ function isKnownNeighbor(stationId: string): boolean {
 }
 
 type StationRole = 'primary' | 'neighbor' | 'unknown';
-function getStationRole(env: Env, stationId: string): StationRole {
-	if (isValidStation(env, stationId)) return 'primary';
+async function getStationRole(env: Env, stationId: string): Promise<StationRole> {
+	if (await isValidStation(env, stationId)) return 'primary';
 	if (isKnownNeighbor(stationId)) return 'neighbor';
 	return 'unknown';
 }
@@ -694,7 +702,7 @@ async function handleHourlyBackfill(req: Request, env: Env, fallbackStationId?: 
 	if (auth) return auth;
 
 	const url = new URL(req.url);
-	const stationId = url.searchParams.get('stationId') ?? fallbackStationId ?? getDefaultStation(env);
+	const stationId = url.searchParams.get('stationId') ?? fallbackStationId ?? (await getDefaultStation(env));
 	if (!stationId) {
 		return jsonResponse({ error: 'Missing stationId. Pass ?stationId=ID or configure a default station.' }, 400);
 	}
@@ -924,7 +932,7 @@ function backfillStateKey(stationId: string): string {
 
 async function handleHistoryDaily(req: Request, env: Env, fallbackStationId?: string): Promise<Response> {
 	const url = new URL(req.url);
-	const stationId = url.searchParams.get('stationId') ?? fallbackStationId ?? getDefaultStation(env);
+	const stationId = url.searchParams.get('stationId') ?? fallbackStationId ?? (await getDefaultStation(env));
 	if (!stationId) {
 		return jsonResponse({ error: 'Missing stationId. Pass ?stationId=ID or configure a default station.' }, 400);
 	}
