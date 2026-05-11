@@ -37,6 +37,7 @@ const binding = args.binding ?? DEFAULT_BINDING;
 const localOnly = Boolean(args.localOnly);
 const skipBackfill = Boolean(args.skipBackfill);
 const skipUpload = Boolean(args.skipUpload);
+const skipNeighbors = Boolean(args.skipNeighbors);
 const dryRun = Boolean(args.dryRun);
 
 console.log(`Adding station: ${stationId}`);
@@ -69,11 +70,24 @@ if (!skipUpload) {
 }
 
 console.log('');
-console.log('Step 4/4: update station-ids in KV');
+console.log('Step 4/5: update station-ids in KV');
 await updateStationIds(stationId);
 
 console.log('');
+console.log('Step 5/5: regenerate neighbors -> KV');
+if (skipNeighbors) {
+	console.log('  skipped (--skip-neighbors)');
+} else {
+	const neighborArgs = ['scripts/discover-neighbors.mjs'];
+	if (localOnly) neighborArgs.push('--local-only');
+	await run('node', neighborArgs);
+}
+
+console.log('');
 console.log(`Done. ${stationId} added.`);
+if (!localOnly && !skipNeighbors) {
+	console.log('Remember: deploy is no longer required for neighbor data (KV is read at runtime).');
+}
 
 async function updateStationIds(newId) {
 	const localList = await readStationIdsFrom('local');
@@ -223,6 +237,7 @@ Options:
   --local-only        Skip remote KV upload and remote station-ids update.
   --skip-backfill     Skip step 1 (history backfill).
   --skip-upload       Skip steps 2-3 (KV uploads).
+  --skip-neighbors    Skip step 5 (neighbor regeneration).
   --dry-run           Print station-ids changes without writing.
 
 Examples:

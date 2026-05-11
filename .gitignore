@@ -173,3 +173,6 @@ qr-test/
 
 # Agent context directories
 .context/
+
+# Local-only station data; the worker reads from KV
+data/

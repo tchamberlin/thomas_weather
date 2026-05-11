@@ -21,8 +21,6 @@
  * temporarily unavailable.
  */
 
-import neighborsData from '../data/neighbors.json';
-
 interface NeighborEntry {
 	stationId: string;
 	name: string | null;
@@ -37,7 +35,18 @@ interface NeighborsFile {
 	generatedAt: string;
 	stations: Record<string, { lat: number; lon: number; neighborhood: string | null; neighbors: NeighborEntry[] }>;
 }
-const NEIGHBORS: NeighborsFile = neighborsData as NeighborsFile;
+const NEIGHBORS_KV_KEY = 'weather:config:neighbors';
+const EMPTY_NEIGHBORS: NeighborsFile = { generatedAt: '', stations: {} };
+
+async function getNeighbors(env: Env): Promise<NeighborsFile> {
+	const raw = await env.WEATHER.get(NEIGHBORS_KV_KEY);
+	if (!raw) return EMPTY_NEIGHBORS;
+	try {
+		const parsed = JSON.parse(raw) as NeighborsFile;
+		if (parsed && typeof parsed === 'object' && parsed.stations) return parsed;
+	} catch {}
+	return EMPTY_NEIGHBORS;
+}
 
 interface NeighborRainReading {
 	stationId: string;
@@ -250,7 +259,8 @@ export default {
 				}));
 				const firstError = stations.find((s): s is { error: string; stationId: string } => 'error' in s);
 				if (firstError) return new Response(firstError.error, { status: 400 });
-				return new Response(renderAllRainPage(spec, stations as MultiRainEntry[]), {
+				const neighbors = await getNeighbors(env);
+				return new Response(renderAllRainPage(spec, stations as MultiRainEntry[], neighbors), {
 					headers: { 'Content-Type': 'text/html; charset=utf-8' },
 				});
 			} catch (err: unknown) {
@@ -280,7 +290,8 @@ export default {
 				}
 				const rainfall = await loadRainfallForDate(env, stationId, dashboard, target.date, target.isToday);
 				const neighborRain = await fetchNeighborRainfallForDate(env, stationId, target.date);
-				return new Response(renderRainPage(dashboard, target, rainfall, neighborRain), {
+				const neighbors = await getNeighbors(env);
+				return new Response(renderRainPage(dashboard, target, rainfall, neighborRain, neighbors), {
 					headers: { 'Content-Type': 'text/html; charset=utf-8' },
 				});
 			} catch (err: unknown) {
@@ -463,7 +474,8 @@ async function fetchNeighborRainfallForDate(
 	primaryId: string,
 	date: string,
 ): Promise<NeighborRainReading[]> {
-	const entry = NEIGHBORS.stations[primaryId];
+	const neighbors = await getNeighbors(env);
+	const entry = neighbors.stations[primaryId];
 	if (!entry || entry.neighbors.length === 0) {
 		console.log(`[neighbors] no neighbors configured for primary=${primaryId}`);
 		return [];
@@ -613,8 +625,9 @@ async function isValidStation(env: Env, stationId: string): Promise<boolean> {
 	return (await getStationIds(env)).includes(stationId);
 }
 
-function isKnownNeighbor(stationId: string): boolean {
-	for (const entry of Object.values(NEIGHBORS.stations)) {
+async function isKnownNeighbor(env: Env, stationId: string): Promise<boolean> {
+	const neighbors = await getNeighbors(env);
+	for (const entry of Object.values(neighbors.stations)) {
 		if (entry.neighbors.some((n) => n.stationId === stationId)) return true;
 	}
 	return false;
@@ -623,7 +636,7 @@ function isKnownNeighbor(stationId: string): boolean {
 type StationRole = 'primary' | 'neighbor' | 'unknown';
 async function getStationRole(env: Env, stationId: string): Promise<StationRole> {
 	if (await isValidStation(env, stationId)) return 'primary';
-	if (isKnownNeighbor(stationId)) return 'neighbor';
+	if (await isKnownNeighbor(env, stationId)) return 'neighbor';
 	return 'unknown';
 }
 
@@ -2275,6 +2288,7 @@ function renderRainPage(
 	target: RainTarget,
 	rainfall: number | null,
 	neighborRain: NeighborRainReading[] = [],
+	neighbors: NeighborsFile = EMPTY_NEIGHBORS,
 ): string {
 	const prettyDate = fmtPrettyDate(target.date);
 	const tz = d.timezone;
@@ -2396,7 +2410,7 @@ ${STATION_MAP_HEAD}
     <a href="/pws/${escHtml(d.stationId)}/dashboard">Full dashboard →</a>
   </div>
 </main>
-<script id="rain-map-data" type="application/json">${safeScriptJson(buildRainMapData(d.stationId, rainfall, neighborRain))}</script>
+<script id="rain-map-data" type="application/json">${safeScriptJson(buildRainMapData(d.stationId, rainfall, neighborRain, neighbors))}</script>
 <script>
 (function () {
   const el = document.getElementById('map');
@@ -2451,7 +2465,7 @@ interface MultiRainEntry {
 	neighborRain: NeighborRainReading[];
 }
 
-function renderAllRainPage(spec: string, entries: MultiRainEntry[]): string {
+function renderAllRainPage(spec: string, entries: MultiRainEntry[], neighbors: NeighborsFile = EMPTY_NEIGHBORS): string {
 	const lower = spec.toLowerCase();
 	const isToday = lower === 'today';
 	const isYesterday = lower === 'yesterday';
@@ -2506,7 +2520,7 @@ ${STATION_MAP_HEAD}
   <div class="map-section"><div id="map"></div></div>
   <div class="stations-row">${cards}</div>
 </main>
-<script id="all-rain-map-data" type="application/json">${safeScriptJson(buildAllRainMapData(entries))}</script>
+<script id="all-rain-map-data" type="application/json">${safeScriptJson(buildAllRainMapData(entries, neighbors))}</script>
 <script>
 (function () {
   const el = document.getElementById('map');
@@ -2604,12 +2618,12 @@ interface AllRainMapData {
 	specPath: string;
 }
 
-function buildAllRainMapData(entries: MultiRainEntry[]): AllRainMapData {
+function buildAllRainMapData(entries: MultiRainEntry[], neighbors: NeighborsFile): AllRainMapData {
 	const primaries: AllRainMapData['primaries'] = [];
 	const neighborMap = new Map<string, { id: string; lat: number | null; lon: number | null; rainfall: number | null }>();
 	const primaryIds = new Set(entries.map((e) => e.stationId));
 	for (const e of entries) {
-		const entry = NEIGHBORS.stations[e.stationId];
+		const entry = neighbors.stations[e.stationId];
 		primaries.push({
 			id: e.stationId,
 			lat: entry?.lat ?? null,
@@ -2640,8 +2654,8 @@ interface RainMapData {
 	neighbors: Array<{ id: string; lat: number | null; lon: number | null; rainfall: number | null; distanceMi: number | null }>;
 }
 
-function buildRainMapData(primaryId: string, primaryRainfall: number | null, neighborRain: NeighborRainReading[]): RainMapData {
-	const primaryEntry = NEIGHBORS.stations[primaryId];
+function buildRainMapData(primaryId: string, primaryRainfall: number | null, neighborRain: NeighborRainReading[], neighbors: NeighborsFile): RainMapData {
+	const primaryEntry = neighbors.stations[primaryId];
 	const neighborMeta = new Map<string, NeighborEntry>();
 	for (const n of primaryEntry?.neighbors ?? []) {
 		neighborMeta.set(n.stationId, n);

@@ -7,13 +7,16 @@ import { spawn } from 'node:child_process';
 
 const API_BASE = 'https://api.weather.com';
 const STATION_IDS_KV_KEY = 'weather:config:station-ids';
+const NEIGHBORS_KV_KEY = 'weather:config:neighbors';
+const DEFAULT_BINDING = 'WEATHER';
 
 const args = parseArgs(process.argv.slice(2));
 const dotEnv = await readDevVars(args.env ?? '.dev.vars');
 const apiKey = cleanSecret(args.apiKey ?? process.env.WU_API_KEY ?? dotEnv.WU_API_KEY);
 const kvScope = args.kvRemote ? 'remote' : 'local';
 const stationsArg = cleanSecret(args.stations) || await readStationIdsFromKv(kvScope);
-const outPath = args.out ?? 'data/neighbors.json';
+const outPath = args.out ? String(args.out) : null;
+const localOnly = args.localOnly === '1' || args.localOnly === true;
 const maxDistanceMi = args.maxDistanceMi === undefined ? null : Number(args.maxDistanceMi);
 const includeSelf = args.includeSelf === '1';
 const requireQc = args.requireQc !== '0';
@@ -74,9 +77,21 @@ for (const primary of primaries) {
 	await sleep(delayMs);
 }
 
-await mkdir(path.dirname(outPath), { recursive: true });
-await writeFile(outPath, `${JSON.stringify(result, null, 2)}\n`);
-console.log(`\nWrote ${outPath}`);
+const serialized = `${JSON.stringify(result, null, 2)}\n`;
+
+const tempFile = path.join('data', '.neighbors.kv.json');
+await mkdir(path.dirname(tempFile), { recursive: true });
+await writeFile(tempFile, serialized);
+
+console.log('');
+await writeNeighborsToKv('local', tempFile);
+if (!localOnly) await writeNeighborsToKv('remote', tempFile);
+
+if (outPath) {
+	await mkdir(path.dirname(outPath), { recursive: true });
+	await writeFile(outPath, serialized);
+	console.log(`Wrote ${outPath} (local debug copy)`);
+}
 
 async function fetchCurrent(stationId) {
 	const url = new URL(`${API_BASE}/v2/pws/observations/current`);
@@ -185,7 +200,27 @@ function sleep(ms) {
 	return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function readStationIdsFromKv(scope, binding = 'WEATHER') {
+async function writeNeighborsToKv(scope, filePath, binding = DEFAULT_BINDING) {
+	const scopeArg = scope === 'remote' ? '--remote' : '--local';
+	const result = await new Promise((resolve) => {
+		const child = spawn(process.platform === 'win32' ? 'npx.cmd' : 'npx', ['wrangler', 'kv', 'key', 'put', NEIGHBORS_KV_KEY, '--binding', binding, '--path', filePath, scopeArg], {
+			cwd: process.cwd(),
+			env: { ...process.env, XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME ?? path.join(process.cwd(), '.wrangler-config') },
+			stdio: ['ignore', 'pipe', 'pipe'],
+		});
+		let stdout = '';
+		let stderr = '';
+		child.stdout.on('data', (c) => { stdout += c; });
+		child.stderr.on('data', (c) => { stderr += c; });
+		child.on('close', (code) => resolve({ code: code ?? 1, stdout, stderr }));
+	});
+	if (result.code !== 0) {
+		throw new Error(`wrangler kv key put (${scope}) failed: ${result.stderr || result.stdout}`);
+	}
+	console.log(`  ${scope} KV: PUT ${NEIGHBORS_KV_KEY}`);
+}
+
+async function readStationIdsFromKv(scope, binding = DEFAULT_BINDING) {
 	const scopeArg = scope === 'remote' ? '--remote' : '--local';
 	const result = await new Promise((resolve) => {
 		const child = spawn(process.platform === 'win32' ? 'npx.cmd' : 'npx', ['wrangler', 'kv', 'key', 'get', STATION_IDS_KV_KEY, '--binding', binding, scopeArg], {
@@ -220,6 +255,8 @@ a cached neighbor map to data/neighbors.json.
 Options:
   --stations <ids>       Comma-separated primary station IDs (default: read from KV weather:config:station-ids)
   --kv-remote            Read station IDs from remote KV instead of local (default: local)
+  --local-only           Skip remote KV write (default: write local + remote KV)
+  --out <path>           Also write a debug JSON copy to this path (default: KV only)
   --out <path>           Output JSON path (default: data/neighbors.json)
   --max-distance-mi <n>  Filter neighbors farther than this distance
   --include-self         Keep the primary station itself in its neighbor list
