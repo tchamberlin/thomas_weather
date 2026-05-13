@@ -199,6 +199,15 @@ const CACHE_PREFIX = 'weather:dailySummaries:v1';
 const HISTORY_PREFIX = 'weather:history:hourly:raw';
 const HISTORY_BLOCK_DAYS = 31;
 
+// In-isolate dedup: skip KV PUTs when payload bytes match the last value we wrote.
+// Isolate restarts will re-PUT once; that's acceptable.
+const WRITE_DEDUP_CACHE = new Map<string, string>();
+// Marks (station, blockStart, blockEnd) tuples whose contribution is already reflected
+// in the history index for this isolate — lets updateHistoryIndex short-circuit without a GET.
+const HISTORY_INDEX_DONE = new Set<string>();
+// Per-isolate marker: have we ensured the previous-month block exists for this station?
+const PREV_MONTH_ENSURED = new Set<string>();
+
 export default {
 	async scheduled(_event: ScheduledController, env: Env, _ctx: ExecutionContext): Promise<void> {
 		console.log('[cron] scheduled run started');
@@ -803,10 +812,35 @@ async function refreshDailySummaryCache(env: Env, stationId: string): Promise<vo
 }
 
 async function refreshRecentHistory(env: Env, stationId: string): Promise<void> {
-	const end = dateToYmd(addUtcDays(new Date(), -1));
-	const start = dateToYmd(addUtcDays(ymdToDate(end), -HISTORY_BLOCK_DAYS + 1));
-	const raw = await fetchHistoryHourlyRawRange(env, stationId, start, end);
-	await writeHistoryBlock(env, stationId, historyBlockKey(stationId, start, end), raw.text, start, end, raw.records);
+	const now = new Date();
+	const yesterdayYmd = dateToYmd(addUtcDays(now, -1));
+	const currentMonthStart = monthStartYmd(now);
+	const currentMonthEnd = monthEndYmd(now);
+
+	// Stable per-calendar-month key. Mid-month payloads are partial; the key range claims
+	// the full month so readers can look it up deterministically.
+	if (currentMonthStart <= yesterdayYmd) {
+		const fetchEnd = minYmd(currentMonthEnd, yesterdayYmd);
+		const raw = await fetchHistoryHourlyRawRange(env, stationId, currentMonthStart, fetchEnd);
+		const key = historyBlockKey(stationId, currentMonthStart, currentMonthEnd);
+		await writeHistoryBlock(env, stationId, key, raw.text, currentMonthStart, currentMonthEnd, raw.records);
+	}
+
+	// Make sure the previous month's block exists. Once written, dedup keeps subsequent
+	// ticks no-op since the prior month no longer changes.
+	const prevAnchor = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 15));
+	const prevStart = monthStartYmd(prevAnchor);
+	const prevEnd = monthEndYmd(prevAnchor);
+	const prevMarker = `${stationId}:${prevStart}`;
+	if (!PREV_MONTH_ENSURED.has(prevMarker)) {
+		const existing = await env.WEATHER.get(historyBlockKey(stationId, prevStart, prevEnd));
+		if (!existing) {
+			const raw = await fetchHistoryHourlyRawRange(env, stationId, prevStart, prevEnd);
+			const key = historyBlockKey(stationId, prevStart, prevEnd);
+			await writeHistoryBlock(env, stationId, key, raw.text, prevStart, prevEnd, raw.records);
+		}
+		PREV_MONTH_ENSURED.add(prevMarker);
+	}
 }
 
 async function fetchHourly7Day(env: Env, stationId: string): Promise<WUHistoryObservation[]> {
@@ -817,18 +851,16 @@ async function fetchHourly7Day(env: Env, stationId: string): Promise<WUHistoryOb
 
 	if (env.WEATHER) {
 		try {
-			const entries = await listHistoryBlockKeys(env, stationId, start, today);
-			if (entries.length > 0) {
-				const blocks = await Promise.all(entries.map((entry) => env.WEATHER.get(entry.name)));
-				const observations = blocks.flatMap((raw) => parseHistoryObservations(raw));
-				const filtered = observations.filter((obs) => {
-					if (!obs.obsTimeLocal) return false;
-					const date = localDate(obs.obsTimeLocal);
-					return date >= isoStart && date <= isoEnd;
-				});
-				if (filtered.length > 0) {
-					return filtered.sort((a, b) => (a.epoch ?? 0) - (b.epoch ?? 0));
-				}
+			const keys = monthKeysForRange(stationId, start, today);
+			const blocks = await Promise.all(keys.map((key) => env.WEATHER.get(key)));
+			const observations = blocks.flatMap((raw) => parseHistoryObservations(raw));
+			const filtered = observations.filter((obs) => {
+				if (!obs.obsTimeLocal) return false;
+				const date = localDate(obs.obsTimeLocal);
+				return date >= isoStart && date <= isoEnd;
+			});
+			if (filtered.length > 0) {
+				return filtered.sort((a, b) => (a.epoch ?? 0) - (b.epoch ?? 0));
 			}
 		} catch {
 			// Fall through to API
@@ -860,6 +892,11 @@ async function writeHistoryBlock(
 	records: number,
 ): Promise<void> {
 	if (!env.WEATHER) return;
+	if (WRITE_DEDUP_CACHE.get(kvKey) === rawJson) {
+		// Payload unchanged since this isolate's last write — skip the PUT and the
+		// downstream index update (which would also have no effect).
+		return;
+	}
 	await env.WEATHER.put(kvKey, rawJson, {
 		metadata: {
 			stationId: stationId,
@@ -870,27 +907,41 @@ async function writeHistoryBlock(
 			storedAt: new Date().toISOString(),
 		},
 	});
+	WRITE_DEDUP_CACHE.set(kvKey, rawJson);
 	await updateHistoryIndex(env, stationId, startDate, endDate, records);
 }
 
 async function updateHistoryIndex(env: Env, stationId: string, startDate: string, endDate: string, records: number): Promise<void> {
+	if (!env.WEATHER) return;
+	const signature = `${stationId}:${startDate}:${endDate}`;
+	if (HISTORY_INDEX_DONE.has(signature)) return;
+
 	const existing = await readHistoryIndex(env, stationId);
+	const startIso = ymdToIsoDate(startDate);
+	const endIso = ymdToIsoDate(endDate);
+	const earliest = existing?.earliestDate && existing.earliestDate < startIso ? existing.earliestDate : startIso;
+	const latest = existing?.latestDate && existing.latestDate > endIso ? existing.latestDate : endIso;
+
+	if (existing && existing.earliestDate === earliest && existing.latestDate === latest) {
+		// Index already covers this contribution — no PUT needed.
+		HISTORY_INDEX_DONE.add(signature);
+		return;
+	}
+
 	const next: HistoryIndex = {
 		stationId: stationId,
 		endpoint: 'hourly',
-		earliestDate:
-			existing?.earliestDate && existing.earliestDate < ymdToIsoDate(startDate)
-				? existing.earliestDate
-				: ymdToIsoDate(startDate),
-		latestDate:
-			existing?.latestDate && existing.latestDate > ymdToIsoDate(endDate)
-				? existing.latestDate
-				: ymdToIsoDate(endDate),
-		blocksStored: (existing?.blocksStored ?? 0) + 1,
-		recordsStored: (existing?.recordsStored ?? 0) + records,
+		earliestDate: earliest,
+		latestDate: latest,
+		// Counters frozen: the cron now rewrites stable month-aligned keys, so naive
+		// "+1 per call" inflated them indefinitely. Treat both as best-effort metadata
+		// rather than authoritative state.
+		blocksStored: existing?.blocksStored ?? 0,
+		recordsStored: existing?.recordsStored ?? 0,
 		updatedAt: new Date().toISOString(),
 	};
 	await env.WEATHER.put(historyIndexKey(stationId), JSON.stringify(next));
+	HISTORY_INDEX_DONE.add(signature);
 }
 
 async function readHistoryIndex(env: Env, stationId: string): Promise<HistoryIndex | null> {
@@ -968,8 +1019,25 @@ async function handleHistoryDaily(req: Request, env: Env, fallbackStationId?: st
 	return jsonResponse({ stationId: stationId, start, end, days, index: await readHistoryIndex(env, stationId) });
 }
 
-async function loadHistoryDailyRange(env: Env, stationId: string, start: string, end: string): Promise<DailyWeather[]> {
+async function loadHistoryDailyRange(
+	env: Env,
+	stationId: string,
+	start: string,
+	end: string,
+	options: { deterministic?: boolean } = {},
+): Promise<DailyWeather[]> {
 	if (!env.WEATHER) return [];
+
+	// Hot path: skip WEATHER.list entirely by deriving month-aligned keys from the range.
+	// Only safe for stations whose data is written by the cron (primary stations);
+	// neighbor stations may have legacy 31-day backfill keys that aren't month-aligned.
+	if (options.deterministic) {
+		const keys = monthKeysForRange(stationId, isoDateToYmd(start), isoDateToYmd(end));
+		const blocks = await Promise.all(keys.map((key) => env.WEATHER.get(key)));
+		const observations = blocks.flatMap((raw) => parseHistoryObservations(raw));
+		return aggregateHistoryObservations(observations, start, end);
+	}
+
 	const entries = await listHistoryBlockKeys(env, stationId, isoDateToYmd(start), isoDateToYmd(end));
 	const blocks = await Promise.all(entries.map((entry) => env.WEATHER.get(entry.name)));
 	const observations = blocks.flatMap((raw) => parseHistoryObservations(raw));
@@ -1086,9 +1154,13 @@ async function loadDailySummaries(env: Env, stationId: string): Promise<{ days: 
 
 async function cacheDailySummaries(env: Env, stationId: string, days: DailyWeather[]): Promise<void> {
 	if (!env.WEATHER || days.length === 0) return;
-	await env.WEATHER.put(dailySummariesCacheKey(stationId), JSON.stringify(days), {
+	const key = dailySummariesCacheKey(stationId);
+	const payload = JSON.stringify(days);
+	if (WRITE_DEDUP_CACHE.get(key) === payload) return;
+	await env.WEATHER.put(key, payload, {
 		metadata: { stationId: stationId, cachedAt: new Date().toISOString() },
 	});
+	WRITE_DEDUP_CACHE.set(key, payload);
 }
 
 async function readCachedDailySummaries(env: Env, stationId: string): Promise<DailyWeather[]> {
@@ -1216,7 +1288,7 @@ async function loadRainfallForDate(
 	}
 	const recent = dashboard.recentDays.find((d) => d.date === date);
 	if (recent) return recent.rainfall;
-	const days = await loadHistoryDailyRange(env, stationId, date, date);
+	const days = await loadHistoryDailyRange(env, stationId, date, date, { deterministic: true });
 	return days.find((d) => d.date === date)?.rainfall ?? null;
 }
 
@@ -1288,6 +1360,28 @@ function addUtcDays(date: Date, days: number): Date {
 
 function minYmd(a: string, b: string): string {
 	return a < b ? a : b;
+}
+
+function monthStartYmd(date: Date): string {
+	return `${date.getUTCFullYear()}${String(date.getUTCMonth() + 1).padStart(2, '0')}01`;
+}
+
+function monthEndYmd(date: Date): string {
+	const last = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth() + 1, 0));
+	return dateToYmd(last);
+}
+
+// Returns the month-aligned history block keys covering the given YMD range, in order.
+function monthKeysForRange(stationId: string, startYmd: string, endYmd: string): string[] {
+	const keys: string[] = [];
+	const startDate = ymdToDate(startYmd);
+	let cursor = new Date(Date.UTC(startDate.getUTCFullYear(), startDate.getUTCMonth(), 1));
+	const endDate = ymdToDate(endYmd);
+	while (cursor <= endDate) {
+		keys.push(historyBlockKey(stationId, monthStartYmd(cursor), monthEndYmd(cursor)));
+		cursor = new Date(Date.UTC(cursor.getUTCFullYear(), cursor.getUTCMonth() + 1, 1));
+	}
+	return keys;
 }
 
 function jsonResponse(value: unknown, status = 200): Response {
