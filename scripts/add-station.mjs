@@ -74,12 +74,15 @@ console.log('Step 4/5: update station-ids in KV');
 await updateStationIds(stationId);
 
 console.log('');
-console.log('Step 5/5: regenerate neighbors -> KV');
+console.log('Step 5/5: discover neighbors for this station -> KV');
 if (skipNeighbors) {
 	console.log('  skipped (--skip-neighbors)');
 } else {
-	const neighborArgs = ['scripts/discover-neighbors.mjs'];
+	// Only this station changed, so merge it into the existing neighbors map
+	// instead of re-fetching every primary station from scratch.
+	const neighborArgs = ['scripts/discover-neighbors.mjs', '--stations', stationId, '--merge'];
 	if (localOnly) neighborArgs.push('--local-only');
+	else neighborArgs.push('--kv-remote');
 	await run('node', neighborArgs);
 }
 
