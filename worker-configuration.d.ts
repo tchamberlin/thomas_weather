@@ -11,6 +11,7 @@ declare namespace Cloudflare {
 		WU_API_KEY: string;
 		WU_STATION_IDS: string;
 		BACKFILL_TOKEN: string;
+		NEIGHBOR_REFRESH_EVERY_N_TICKS: string;
 	}
 }
 interface Env extends Cloudflare.Env {}

@@ -213,12 +213,30 @@ const HISTORY_INDEX_DONE = new Set<string>();
 const PREV_MONTH_ENSURED = new Set<string>();
 
 export default {
-	async scheduled(_event: ScheduledController, env: Env, _ctx: ExecutionContext): Promise<void> {
+	// The cron is the ONLY place WU is touched on a schedule. It constructs the
+	// `WuClient` capability and refreshes every KV cache the request path reads.
+	async scheduled(event: ScheduledController, env: Env, _ctx: ExecutionContext): Promise<void> {
 		console.log('[cron] scheduled run started');
-		const stationIds = await getStationIds(env);
-		for (const stationId of stationIds) {
-			await refreshDailySummaryCache(env, stationId);
-			await refreshRecentHistory(env, stationId);
+		const wu = createWuClient(env);
+
+		const tickIndex = Math.floor(event.scheduledTime / (15 * 60 * 1000));
+		const neighborEveryN = neighborRefreshEveryNTicks(env);
+		const refreshNeighbors = tickIndex % neighborEveryN === 0;
+
+		const primaryIds = await getStationIds(env);
+		console.log(`[cron] refreshing ${primaryIds.length} primary stations (tick ${tickIndex})`);
+		for (const stationId of primaryIds) {
+			await refreshStation(wu, env, stationId);
+		}
+
+		if (refreshNeighbors) {
+			const neighborIds = await getNeighborStationIds(env);
+			console.log(`[cron] refreshing ${neighborIds.length} neighbor stations (tick ${tickIndex}, every ${neighborEveryN})`);
+			for (const stationId of neighborIds) {
+				await refreshStation(wu, env, stationId);
+			}
+		} else {
+			console.log(`[cron] skipping neighbor refresh (tick ${tickIndex}, cadence every ${neighborEveryN})`);
 		}
 		console.log('[cron] scheduled run completed');
 	},
@@ -255,10 +273,6 @@ export default {
 			if (pwsStations.length === 0) {
 				return new Response('Missing ?pws=K1,K2 query parameter.', { status: 400 });
 			}
-			const { WU_API_KEY } = weatherConfig(env);
-			if (!WU_API_KEY) {
-				return new Response('Missing WU_API_KEY configuration.', { status: 500 });
-			}
 			try {
 				const stations = await Promise.all(pwsStations.map(async ({ id: stationId, label }) => {
 					const dashboard = await buildDashboard(env, stationId);
@@ -291,10 +305,6 @@ export default {
 			if (!(await isValidStation(env, stationId))) {
 				return new Response('Station not found.', { status: 404 });
 			}
-			const { WU_API_KEY } = weatherConfig(env);
-			if (!WU_API_KEY) {
-				return new Response('Missing WU_API_KEY configuration.', { status: 500 });
-			}
 			try {
 				const dashboard = await buildDashboard(env, stationId);
 				const target = resolveRainTarget(dashboard, spec);
@@ -321,10 +331,6 @@ export default {
 			const question = pwsQMatch[2];
 			if (!(await isValidStation(env, stationId))) {
 				return new Response('Station not found.', { status: 404 });
-			}
-			const { WU_API_KEY } = weatherConfig(env);
-			if (!WU_API_KEY) {
-				return new Response('Missing WU_API_KEY configuration.', { status: 500 });
 			}
 			try {
 				const dashboard = await buildDashboard(env, stationId);
@@ -428,7 +434,7 @@ async function buildDashboard(env: Env, stationId: string): Promise<DashboardDat
 		loadDailySummaries(env, stationId),
 		loadCurrent(env, stationId),
 		readHistoryIndex(env, stationId),
-		fetchHourly7Day(env, stationId),
+		loadHourly7Day(env, stationId),
 	]);
 	const current = currentResult.current;
 	const recentDays = dailyResult.days;
@@ -457,23 +463,49 @@ async function buildDashboard(env: Env, stationId: string): Promise<DashboardDat
 }
 
 async function loadCurrent(env: Env, stationId: string): Promise<{ current: WUCurrentObservation | null; warning: string | null }> {
+	const current = await readCachedCurrent(env, stationId);
+	if (current) return { current, warning: null };
+	return { current: null, warning: 'Current conditions unavailable (not yet cached by the scheduled refresh).' };
+}
+
+const CURRENT_PREFIX = 'weather:current:v1';
+
+function currentCacheKey(stationId: string): string {
+	return `${CURRENT_PREFIX}:${stationId}`;
+}
+
+async function readCachedCurrent(env: Env, stationId: string): Promise<WUCurrentObservation | null> {
+	if (!env.WEATHER) return null;
+	const raw = await env.WEATHER.get(currentCacheKey(stationId));
+	if (!raw) return null;
 	try {
-		return { current: await fetchCurrent(env, stationId), warning: null };
-	} catch (err: unknown) {
-		const msg = err instanceof Error ? err.message : String(err);
-		return { current: null, warning: `Current conditions unavailable. ${msg}` };
+		return JSON.parse(raw) as WUCurrentObservation;
+	} catch {
+		return null;
 	}
 }
 
-async function fetchCurrent(env: Env, stationId: string): Promise<WUCurrentObservation | null> {
-	const body = await fetchJson<WUCurrentResponse>(env, stationId, '/v2/pws/observations/current', {
+/** KV write only — no WU access. Caller supplies the observation from the cron's single fetch. */
+async function cacheCurrent(env: Env, stationId: string, current: WUCurrentObservation): Promise<void> {
+	if (!env.WEATHER) return;
+	const key = currentCacheKey(stationId);
+	const payload = JSON.stringify(current);
+	if (WRITE_DEDUP_CACHE.get(key) === payload) return;
+	await env.WEATHER.put(key, payload, {
+		metadata: { stationId, cachedAt: new Date().toISOString() },
+	});
+	WRITE_DEDUP_CACHE.set(key, payload);
+}
+
+async function fetchCurrent(wu: WuClient, stationId: string): Promise<WUCurrentObservation | null> {
+	const body = await fetchJson<WUCurrentResponse>(wu, stationId, '/v2/pws/observations/current', {
 		numericPrecision: false,
 	});
 	return body.observations?.[0] ?? null;
 }
 
-async function fetchDailySummaries(env: Env, stationId: string): Promise<DailyWeather[]> {
-	const body = await fetchJson<WUDailySummaryResponse>(env, stationId, '/v2/pws/dailysummary/7day', {
+async function fetchDailySummaries(wu: WuClient, stationId: string): Promise<DailyWeather[]> {
+	const body = await fetchJson<WUDailySummaryResponse>(wu, stationId, '/v2/pws/dailysummary/7day', {
 		numericPrecision: true,
 	});
 	return (body.summaries ?? [])
@@ -497,7 +529,8 @@ async function fetchNeighborRainfallForDate(
 	return Promise.all(
 		entry.neighbors.map(async (n): Promise<NeighborRainReading> => {
 			const base = { stationId: n.stationId, name: n.name, distanceMi: n.distanceMi };
-			// 1. KV history blocks (primary source)
+			// KV history blocks only — populated by the cron. The request path never
+			// hits WU live; neighbor data not yet in KV simply reads as unavailable.
 			try {
 				const days = await loadHistoryDailyRange(env, n.stationId, date, date);
 				const match = days.find((d) => d.date === date);
@@ -506,23 +539,11 @@ async function fetchNeighborRainfallForDate(
 					return { ...base, rainfall: match.rainfall, error: null };
 				}
 				const reason = match ? 'date matched but rainfall=null' : `no block covered ${date} (blocks loaded=${days.length}, dates=${days.map((d) => d.date).join(',') || 'none'})`;
-				console.warn(`[neighbors] KV-MISS ${n.stationId} ${date} — ${reason}; trying 7-day summary fallback`);
+				console.warn(`[neighbors] KV-MISS ${n.stationId} ${date} — ${reason}`);
+				return { ...base, rainfall: null, error: 'no data in KV' };
 			} catch (err: unknown) {
-				console.warn(`[neighbors] KV-ERR  ${n.stationId} ${date}: ${err instanceof Error ? err.message : String(err)}; trying 7-day summary fallback`);
-			}
-			// 2. Fallback: WU 7-day daily summary (live API; covers today + last 6 days)
-			try {
-				const summaries = await fetchDailySummaries(env, n.stationId);
-				const summary = summaries.find((d) => d.date === date);
-				if (summary && summary.rainfall !== null) {
-					console.warn(`[neighbors] FALLBACK-HIT  ${n.stationId} ${date} rain=${summary.rainfall} (via WU 7-day summary — KV not populated for this date)`);
-					return { ...base, rainfall: summary.rainfall, error: null };
-				}
-				console.warn(`[neighbors] FALLBACK-MISS ${n.stationId} ${date} — 7-day summary returned dates=[${summaries.map((d) => d.date).join(',')}]${summary ? ' (date present but rainfall=null)' : ''}`);
-				return { ...base, rainfall: null, error: 'no data in KV or 7-day summary' };
-			} catch (err: unknown) {
-				const msg = err instanceof Error ? err.message : String(err);
-				console.warn(`[neighbors] FALLBACK-ERR  ${n.stationId} ${date}: ${msg}`);
+				const msg = errMsg(err);
+				console.warn(`[neighbors] KV-ERR  ${n.stationId} ${date}: ${msg}`);
 				return { ...base, rainfall: null, error: msg };
 			}
 		}),
@@ -530,12 +551,12 @@ async function fetchNeighborRainfallForDate(
 }
 
 async function fetchHistoryHourlyRawRange(
-	env: Env,
+	wu: WuClient,
 	stationId: string,
 	startDate: string,
 	endDate: string,
 ): Promise<{ text: string; records: number }> {
-	const text = await fetchRaw(env, stationId, '/v2/pws/history/hourly', {
+	const text = await fetchRaw(wu, stationId, '/v2/pws/history/hourly', {
 		numericPrecision: true,
 		params: { startDate, endDate },
 	});
@@ -550,12 +571,11 @@ async function fetchHistoryHourlyRawRange(
 }
 
 async function fetchJson<T>(
-	env: Env,
+	wu: WuClient,
 	stationId: string,
 	path: string,
 	options: { numericPrecision: boolean; params?: Record<string, string> },
 ): Promise<T> {
-	const { WU_API_KEY } = weatherConfig(env);
 	const url = new URL(`https://api.weather.com${path}`);
 	url.searchParams.set('stationId', stationId);
 	url.searchParams.set('format', 'json');
@@ -566,7 +586,8 @@ async function fetchJson<T>(
 	for (const [key, value] of Object.entries(options.params ?? {})) {
 		url.searchParams.set(key, value);
 	}
-	url.searchParams.set('apiKey', WU_API_KEY);
+	url.searchParams.set('apiKey', wu.apiKey);
+	assertWuUrl(url, wu);
 
 	const res = await fetch(url.toString(), {
 		headers: { Accept: 'application/json' },
@@ -582,12 +603,11 @@ async function fetchJson<T>(
 }
 
 async function fetchRaw(
-	env: Env,
+	wu: WuClient,
 	stationId: string,
 	path: string,
 	options: { numericPrecision: boolean; params?: Record<string, string> },
 ): Promise<string> {
-	const { WU_API_KEY } = weatherConfig(env);
 	const url = new URL(`https://api.weather.com${path}`);
 	url.searchParams.set('stationId', stationId);
 	url.searchParams.set('format', 'json');
@@ -598,7 +618,8 @@ async function fetchRaw(
 	for (const [key, value] of Object.entries(options.params ?? {})) {
 		url.searchParams.set(key, value);
 	}
-	url.searchParams.set('apiKey', WU_API_KEY);
+	url.searchParams.set('apiKey', wu.apiKey);
+	assertWuUrl(url, wu);
 
 	const res = await fetch(url.toString(), {
 		headers: { Accept: 'application/json' },
@@ -613,10 +634,41 @@ async function fetchRaw(
 	return body;
 }
 
-function weatherConfig(env: Env): { WU_API_KEY: string } {
-	return {
-		WU_API_KEY: cleanSecret(env.WU_API_KEY),
-	};
+/**
+ * Capability object that authorizes Weather Underground API access.
+ *
+ * Constructed ONLY in `scheduled()` (the cron) and in admin handlers after
+ * `authorizeAdmin` passes. The request path never builds one, so reader code
+ * cannot reach WU — the boundary is enforced by the type system. `fetchJson` /
+ * `fetchRaw` take a `WuClient` instead of `env`, so the API key is unreachable
+ * without this capability.
+ */
+interface WuClient {
+	readonly apiKey: string;
+}
+
+function createWuClient(env: Env): WuClient {
+	const apiKey = cleanSecret(env.WU_API_KEY);
+	if (!apiKey) throw new Error('Missing WU_API_KEY configuration.');
+	return { apiKey };
+}
+
+/** Tripwire: the only two functions that fetch WU must go through here. */
+function assertWuUrl(url: URL, wu: WuClient): void {
+	if (url.hostname !== 'api.weather.com' || !wu.apiKey) {
+		throw new Error(`Refusing WU fetch: host=${url.hostname} authorized=${Boolean(wu.apiKey)}`);
+	}
+}
+
+function errMsg(err: unknown): string {
+	return err instanceof Error ? err.message : String(err);
+}
+
+/** Cron tick cadence for refreshing neighbor stations (every Nth 15-min tick). */
+function neighborRefreshEveryNTicks(env: Env): number {
+	const raw = cleanSecret(env.NEIGHBOR_REFRESH_EVERY_N_TICKS);
+	const n = raw ? Number.parseInt(raw, 10) : NaN;
+	return Number.isFinite(n) && n >= 1 ? n : 4;
 }
 const STATION_IDS_KV_KEY = 'weather:config:station-ids';
 
@@ -644,6 +696,17 @@ async function isKnownNeighbor(env: Env, stationId: string): Promise<boolean> {
 		if (entry.neighbors.some((n) => n.stationId === stationId)) return true;
 	}
 	return false;
+}
+
+// Distinct neighbor station IDs across all primaries — the set the cron
+// refreshes on the slower `NEIGHBOR_REFRESH_EVERY_N_TICKS` cadence.
+async function getNeighborStationIds(env: Env): Promise<string[]> {
+	const neighbors = await getNeighbors(env);
+	const ids = new Set<string>();
+	for (const entry of Object.values(neighbors.stations)) {
+		for (const n of entry.neighbors) ids.add(n.stationId);
+	}
+	return [...ids];
 }
 
 type StationRole = 'primary' | 'neighbor' | 'unknown';
@@ -675,25 +738,34 @@ const COORDS_TTL_SECONDS = 60 * 60 * 24 * 30;
 
 type StationLatLon = Omit<StationCoords, 'stats'>;
 
+function coordsCacheKey(stationId: string): string {
+	return `${COORDS_KV_PREFIX}:${stationId}`;
+}
+
+// Read-only: coords are populated by the cron via `cacheStationCoords`. A
+// station with no cached coords is simply omitted from the response — the
+// request path never fetches WU to discover them.
 async function getStationCoords(env: Env, stationId: string): Promise<StationLatLon | null> {
-	const key = `${COORDS_KV_PREFIX}:${stationId}`;
-	const cached = await env.WEATHER.get(key);
-	if (cached) {
-		try {
-			const parsed = JSON.parse(cached) as { lat: number; lon: number };
-			if (typeof parsed.lat === 'number' && typeof parsed.lon === 'number') {
-				return { id: stationId, lat: parsed.lat, lon: parsed.lon };
-			}
-		} catch {}
-	}
-	const current = await fetchCurrent(env, stationId).catch(() => null);
-	if (current && typeof current.lat === 'number' && typeof current.lon === 'number') {
-		await env.WEATHER.put(key, JSON.stringify({ lat: current.lat, lon: current.lon }), {
-			expirationTtl: COORDS_TTL_SECONDS,
-		});
-		return { id: stationId, lat: current.lat, lon: current.lon };
-	}
+	const cached = await env.WEATHER.get(coordsCacheKey(stationId));
+	if (!cached) return null;
+	try {
+		const parsed = JSON.parse(cached) as { lat: number; lon: number };
+		if (typeof parsed.lat === 'number' && typeof parsed.lon === 'number') {
+			return { id: stationId, lat: parsed.lat, lon: parsed.lon };
+		}
+	} catch {}
 	return null;
+}
+
+/** KV write only — derives coords from the cron's already-fetched observation. */
+async function cacheStationCoords(env: Env, stationId: string, current: WUCurrentObservation): Promise<void> {
+	if (!env.WEATHER) return;
+	if (typeof current.lat !== 'number' || typeof current.lon !== 'number') return;
+	await env.WEATHER.put(
+		coordsCacheKey(stationId),
+		JSON.stringify({ lat: current.lat, lon: current.lon }),
+		{ expirationTtl: COORDS_TTL_SECONDS },
+	);
 }
 
 function meanOrNull(vals: Array<number | null>): number | null {
@@ -727,21 +799,14 @@ function obsTimeMs(o: WUHistoryObservation): number {
 	return typeof o.epoch === 'number' ? o.epoch * 1000 : NaN;
 }
 
+// Pure derivation over already-cached KV data — no WU access, no dedicated KV
+// key. `current`, `hourly`, and `days` all come from caches the cron populates.
 async function getStationSpanStats(env: Env, stationId: string): Promise<StationSpanStats> {
 	const empty = (): SpanStats => ({ rain: null, tempAvg: null, windAvg: null });
 	const [current, hourly, days] = await Promise.all([
-		fetchCurrent(env, stationId).catch((err) => {
-			console.warn(`[spanstats] ${stationId} current failed: ${err instanceof Error ? err.message : String(err)}`);
-			return null;
-		}),
-		fetchHourly7Day(env, stationId).catch((err) => {
-			console.warn(`[spanstats] ${stationId} hourly failed: ${err instanceof Error ? err.message : String(err)}`);
-			return [] as WUHistoryObservation[];
-		}),
-		loadDailySummaries(env, stationId).then((r) => r.days).catch((err) => {
-			console.warn(`[spanstats] ${stationId} daily failed: ${err instanceof Error ? err.message : String(err)}`);
-			return [] as DailyWeather[];
-		}),
+		readCachedCurrent(env, stationId),
+		loadHourly7Day(env, stationId),
+		loadDailySummaries(env, stationId).then((r) => r.days),
 	]);
 
 	const cur = empty();
@@ -847,6 +912,8 @@ async function handleHourlyBackfill(req: Request, env: Env, fallbackStationId?: 
 	const auth = authorizeAdmin(req, env);
 	if (auth) return auth;
 
+	// WU access is granted only after the admin token check above passes.
+	const wu = createWuClient(env);
 	const url = new URL(req.url);
 	const stationId = url.searchParams.get('stationId') ?? fallbackStationId ?? (await getDefaultStation(env));
 	if (!stationId) {
@@ -887,7 +954,7 @@ async function handleHourlyBackfill(req: Request, env: Env, fallbackStationId?: 
 
 	const blockStart = state.cursorDate;
 	const blockEnd = minYmd(dateToYmd(addUtcDays(ymdToDate(blockStart), HISTORY_BLOCK_DAYS - 1)), state.endDate);
-	const raw = await fetchHistoryHourlyRawRange(env, stationId, blockStart, blockEnd);
+	const raw = await fetchHistoryHourlyRawRange(wu, stationId, blockStart, blockEnd);
 	const kvKey = historyBlockKey(stationId, blockStart, blockEnd);
 	await writeHistoryBlock(env, stationId, kvKey, raw.text, blockStart, blockEnd, raw.records);
 
@@ -930,12 +997,12 @@ function authorizeAdmin(req: Request, env: Env): Response | null {
 	return null;
 }
 
-async function refreshDailySummaryCache(env: Env, stationId: string): Promise<void> {
-	const days = await fetchDailySummaries(env, stationId);
+async function refreshDailySummaryCache(wu: WuClient, env: Env, stationId: string): Promise<void> {
+	const days = await fetchDailySummaries(wu, stationId);
 	await cacheDailySummaries(env, stationId, days);
 }
 
-async function refreshRecentHistory(env: Env, stationId: string): Promise<void> {
+async function refreshRecentHistory(wu: WuClient, env: Env, stationId: string): Promise<void> {
 	const now = new Date();
 	const yesterdayYmd = dateToYmd(addUtcDays(now, -1));
 	const currentMonthStart = monthStartYmd(now);
@@ -945,7 +1012,7 @@ async function refreshRecentHistory(env: Env, stationId: string): Promise<void> 
 	// the full month so readers can look it up deterministically.
 	if (currentMonthStart <= yesterdayYmd) {
 		const fetchEnd = minYmd(currentMonthEnd, yesterdayYmd);
-		const raw = await fetchHistoryHourlyRawRange(env, stationId, currentMonthStart, fetchEnd);
+		const raw = await fetchHistoryHourlyRawRange(wu, stationId, currentMonthStart, fetchEnd);
 		const key = historyBlockKey(stationId, currentMonthStart, currentMonthEnd);
 		await writeHistoryBlock(env, stationId, key, raw.text, currentMonthStart, currentMonthEnd, raw.records);
 	}
@@ -959,7 +1026,7 @@ async function refreshRecentHistory(env: Env, stationId: string): Promise<void> 
 	if (!PREV_MONTH_ENSURED.has(prevMarker)) {
 		const existing = await env.WEATHER.get(historyBlockKey(stationId, prevStart, prevEnd));
 		if (!existing) {
-			const raw = await fetchHistoryHourlyRawRange(env, stationId, prevStart, prevEnd);
+			const raw = await fetchHistoryHourlyRawRange(wu, stationId, prevStart, prevEnd);
 			const key = historyBlockKey(stationId, prevStart, prevEnd);
 			await writeHistoryBlock(env, stationId, key, raw.text, prevStart, prevEnd, raw.records);
 		}
@@ -967,34 +1034,40 @@ async function refreshRecentHistory(env: Env, stationId: string): Promise<void> 
 	}
 }
 
-async function fetchHourly7Day(env: Env, stationId: string): Promise<WUHistoryObservation[]> {
+// Refreshes every KV cache the request path reads for one station. A single
+// `fetchCurrent` feeds both the current-conditions cache and the coords cache.
+// Per-station errors are logged and swallowed so one bad station can't abort
+// the rest of the cron run.
+async function refreshStation(wu: WuClient, env: Env, stationId: string): Promise<void> {
+	try {
+		const current = await fetchCurrent(wu, stationId).catch((err) => {
+			console.warn(`[cron] ${stationId} current fetch failed: ${errMsg(err)}`);
+			return null;
+		});
+		if (current) {
+			await cacheCurrent(env, stationId, current);
+			await cacheStationCoords(env, stationId, current);
+		}
+		await refreshDailySummaryCache(wu, env, stationId);
+		await refreshRecentHistory(wu, env, stationId);
+	} catch (err: unknown) {
+		console.error(`[cron] ${stationId} refresh failed: ${errMsg(err)}`);
+	}
+}
+
+/** Read-only: builds the 7-day hourly view from KV history blocks. Never hits WU. */
+async function loadHourly7Day(env: Env, stationId: string): Promise<WUHistoryObservation[]> {
+	if (!env.WEATHER) return [];
 	const today = dateToYmd(new Date());
 	const start = dateToYmd(addUtcDays(ymdToDate(today), -6));
 	const isoStart = ymdToIsoDate(start);
 	const isoEnd = ymdToIsoDate(today);
 
-	if (env.WEATHER) {
-		try {
-			const keys = monthKeysForRange(stationId, start, today);
-			const blocks = await Promise.all(keys.map((key) => env.WEATHER.get(key)));
-			const observations = blocks.flatMap((raw) => parseHistoryObservations(raw));
-			const filtered = observations.filter((obs) => {
-				if (!obs.obsTimeLocal) return false;
-				const date = localDate(obs.obsTimeLocal);
-				return date >= isoStart && date <= isoEnd;
-			});
-			if (filtered.length > 0) {
-				return filtered.sort((a, b) => (a.epoch ?? 0) - (b.epoch ?? 0));
-			}
-		} catch {
-			// Fall through to API
-		}
-	}
-
 	try {
-		const raw = await fetchHistoryHourlyRawRange(env, stationId, start, today);
-		const parsed = parseHistoryObservations(raw.text);
-		return parsed
+		const keys = monthKeysForRange(stationId, start, today);
+		const blocks = await Promise.all(keys.map((key) => env.WEATHER.get(key)));
+		const observations = blocks.flatMap((raw) => parseHistoryObservations(raw));
+		return observations
 			.filter((obs) => {
 				if (!obs.obsTimeLocal) return false;
 				const date = localDate(obs.obsTimeLocal);
@@ -1262,18 +1335,14 @@ function normalizeHistoryDay(date: string, observations: WUHistoryObservation[])
 	};
 }
 
+// Read-only: daily summaries come from KV, populated by the cron. On a cache
+// miss the request path returns empty rather than reaching WU live.
 async function loadDailySummaries(env: Env, stationId: string): Promise<{ days: DailyWeather[]; source: string; warning: string | null }> {
 	const cachedDays = await readCachedDailySummaries(env, stationId);
 	if (cachedDays.length > 0) {
 		return { days: cachedDays, source: 'KV cache (refreshed by cron every 15m)', warning: null };
 	}
-	try {
-		const days = await fetchDailySummaries(env, stationId);
-		await cacheDailySummaries(env, stationId, days);
-		return { days, source: 'wunderground.com /v2/pws/dailysummary/7day (cache miss)', warning: null };
-	} catch (err: unknown) {
-		throw err;
-	}
+	return { days: [], source: 'none', warning: 'Daily summaries unavailable (not yet cached by the scheduled refresh).' };
 }
 
 async function cacheDailySummaries(env: Env, stationId: string, days: DailyWeather[]): Promise<void> {
