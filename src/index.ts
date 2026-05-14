@@ -653,16 +653,29 @@ async function getStationRole(env: Env, stationId: string): Promise<StationRole>
 	return 'unknown';
 }
 
+interface SpanStats {
+	rain: number | null;
+	tempAvg: number | null;
+	windAvg: number | null;
+}
+interface StationSpanStats {
+	current: SpanStats;
+	day: SpanStats;
+	week: SpanStats;
+}
 interface StationCoords {
 	id: string;
 	lat: number;
 	lon: number;
+	stats: StationSpanStats;
 }
 
 const COORDS_KV_PREFIX = 'station:coords:v1';
 const COORDS_TTL_SECONDS = 60 * 60 * 24 * 30;
 
-async function getStationCoords(env: Env, stationId: string): Promise<StationCoords | null> {
+type StationLatLon = Omit<StationCoords, 'stats'>;
+
+async function getStationCoords(env: Env, stationId: string): Promise<StationLatLon | null> {
 	const key = `${COORDS_KV_PREFIX}:${stationId}`;
 	const cached = await env.WEATHER.get(key);
 	if (cached) {
@@ -683,8 +696,100 @@ async function getStationCoords(env: Env, stationId: string): Promise<StationCoo
 	return null;
 }
 
+function meanOrNull(vals: Array<number | null>): number | null {
+	const nums = vals.filter((v): v is number => typeof v === 'number');
+	return nums.length > 0 ? nums.reduce((a, b) => a + b, 0) / nums.length : null;
+}
+
+// Hourly precipTotal is a per-day running counter; sum the rises (and treat a
+// drop as a day rollover) to get accumulation across the window. Slightly
+// under-counts because rain before the first sample isn't known.
+function sumPrecipDeltas(obs: WUHistoryObservation[]): number | null {
+	const sorted = [...obs].sort((a, b) => (a.epoch ?? 0) - (b.epoch ?? 0));
+	let total = 0;
+	let prev: number | null = null;
+	let any = false;
+	for (const o of sorted) {
+		const pt = numberOrNull(o.imperial?.precipTotal);
+		if (pt === null) continue;
+		any = true;
+		if (prev !== null) total += pt >= prev ? pt - prev : pt;
+		prev = pt;
+	}
+	return any ? total : null;
+}
+
+function obsTimeMs(o: WUHistoryObservation): number {
+	if (o.obsTimeUtc) {
+		const t = Date.parse(o.obsTimeUtc);
+		if (Number.isFinite(t)) return t;
+	}
+	return typeof o.epoch === 'number' ? o.epoch * 1000 : NaN;
+}
+
+async function getStationSpanStats(env: Env, stationId: string): Promise<StationSpanStats> {
+	const empty = (): SpanStats => ({ rain: null, tempAvg: null, windAvg: null });
+	const [current, hourly, days] = await Promise.all([
+		fetchCurrent(env, stationId).catch((err) => {
+			console.warn(`[spanstats] ${stationId} current failed: ${err instanceof Error ? err.message : String(err)}`);
+			return null;
+		}),
+		fetchHourly7Day(env, stationId).catch((err) => {
+			console.warn(`[spanstats] ${stationId} hourly failed: ${err instanceof Error ? err.message : String(err)}`);
+			return [] as WUHistoryObservation[];
+		}),
+		loadDailySummaries(env, stationId).then((r) => r.days).catch((err) => {
+			console.warn(`[spanstats] ${stationId} daily failed: ${err instanceof Error ? err.message : String(err)}`);
+			return [] as DailyWeather[];
+		}),
+	]);
+
+	const cur = empty();
+	if (current?.imperial) {
+		cur.tempAvg = numberOrNull(current.imperial.temp);
+		cur.windAvg = numberOrNull(current.imperial.windSpeed);
+		cur.rain = numberOrNull(current.imperial.precipTotal);
+	}
+
+	const day = empty();
+	const cutoffMs = Date.now() - 24 * 3600 * 1000;
+	const recent = hourly.filter((o) => {
+		const t = obsTimeMs(o);
+		return Number.isFinite(t) && t >= cutoffMs;
+	});
+	if (recent.length > 0) {
+		day.tempAvg = meanOrNull(recent.map((o) => numberOrNull(o.imperial?.tempAvg ?? o.imperial?.temp)));
+		day.windAvg = meanOrNull(recent.map((o) => numberOrNull(o.imperial?.windspeedAvg ?? o.imperial?.windSpeed)));
+		day.rain = sumPrecipDeltas(recent);
+	}
+
+	const week = empty();
+	if (days.length > 0) {
+		const rainVals = days.map((d) => d.rainfall).filter((r): r is number => typeof r === 'number');
+		week.rain = rainVals.length > 0 ? rainVals.reduce((a, b) => a + b, 0) : null;
+		week.tempAvg = meanOrNull(days.map((d) => d.tempAvg));
+		week.windAvg = meanOrNull(days.map((d) => d.windAvg));
+	}
+
+	console.log(
+		`[spanstats] ${stationId} hourly=${hourly.length} recent24h=${recent.length} ` +
+		`current={t:${cur.tempAvg},w:${cur.windAvg},r:${cur.rain}} ` +
+		`day={t:${day.tempAvg},w:${day.windAvg},r:${day.rain}} week={t:${week.tempAvg},w:${week.windAvg},r:${week.rain}}`,
+	);
+
+	return { current: cur, day, week };
+}
+
 async function getStationCoordsList(env: Env, stationIds: string[]): Promise<StationCoords[]> {
-	const results = await Promise.all(stationIds.map((id) => getStationCoords(env, id)));
+	const results = await Promise.all(
+		stationIds.map(async (id): Promise<StationCoords | null> => {
+			const [coords, stats] = await Promise.all([
+				getStationCoords(env, id),
+				getStationSpanStats(env, id),
+			]);
+			return coords ? { ...coords, stats } : null;
+		}),
+	);
 	return results.filter((c): c is StationCoords => c !== null);
 }
 
@@ -2300,7 +2405,18 @@ const STATION_MAP_HEAD = `<link rel="stylesheet" href="/vendor/leaflet/leaflet.c
 
 const STATION_MAP_STYLES = `#map { height: 60vh; min-height: 420px; width: 100%; border-radius: 8px; background: #eef2f7; }
 .leaflet-container { background: #eef2f7; }
-.leaflet-popup-content a { color: #1a6fd6; }`;
+.leaflet-popup-content a { color: #1a6fd6; }
+.gauge-marker { background: transparent; border: none; }
+.gauge-marker svg { display: block; filter: drop-shadow(0 1px 2px rgba(0,0,0,0.35)); }
+.gauge-tip { display: block; text-align: center; color: #1a1f2c; text-decoration: none; }
+.gauge-tip:hover strong { text-decoration: underline; }
+.gauge-tip-stats { display: block; color: #5a6878; font-size: 0.85em; font-weight: 400; margin-top: 1px; }
+.span-select { display: flex; justify-content: center; margin: 12px 0; }
+.span-select label { padding: 6px 16px; border: 1px solid #d4dae3; border-left-width: 0; background: #fff; cursor: pointer; font-size: 0.9rem; color: #5a6878; user-select: none; }
+.span-select label:first-of-type { border-left-width: 1px; border-radius: 6px 0 0 6px; }
+.span-select label:last-of-type { border-radius: 0 6px 6px 0; }
+.span-select label:has(input:checked) { background: #0e7fcf; color: #fff; border-color: #0e7fcf; }
+.span-select input { position: absolute; opacity: 0; pointer-events: none; }`;
 
 function stationMapInitScript(stations: PwsStation[]): string {
 	const stationsJson = safeScriptJson(stations);
@@ -2320,15 +2436,93 @@ function stationMapInitScript(stations: PwsStation[]): string {
     attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OSM</a> &copy; <a href="https://carto.com/attributions">CARTO</a>',
   }).addTo(map);
   map.setView([39.5, -98.35], 4);
+  var RAIN_MAX = { current: 1, day: 2, week: 3 };
+  var TEMP_MIN_F = 20, TEMP_MAX_F = 90;
+  var WIND_MAX_MPH = 15;
+  var EMPTY_STATS = { rain: null, tempAvg: null, windAvg: null };
+  function clamp01(x) { return Math.max(0, Math.min(1, x)); }
+  function markerSvg(st, span) {
+    // thermometer (left) — mercury level by temp
+    var tf = st.tempAvg == null ? 0 : clamp01((st.tempAvg - TEMP_MIN_F) / (TEMP_MAX_F - TEMP_MIN_F));
+    var mh = 20 * tf;
+    var thermo =
+      '<rect x="9" y="6" width="4" height="24" rx="2" fill="#ffffff" stroke="#5a6878" stroke-width="1.6"/>' +
+      '<circle cx="11" cy="31" r="5" fill="#ffffff" stroke="#5a6878" stroke-width="1.6"/>' +
+      '<circle cx="11" cy="31" r="3" fill="#d83737"/>' +
+      '<rect x="9.8" y="' + (28 - mh).toFixed(1) + '" width="2.4" height="' + (mh + 4).toFixed(1) + '" rx="1.2" fill="#d83737"/>' +
+      '<line x1="13" y1="11" x2="15" y2="11" stroke="#5a6878" stroke-width="1.2"/>' +
+      '<line x1="13" y1="16" x2="15" y2="16" stroke="#5a6878" stroke-width="1.2"/>' +
+      '<line x1="13" y1="21" x2="15" y2="21" stroke="#5a6878" stroke-width="1.2"/>';
+    // rain gauge (center) — water level by rainfall over the span
+    var rf = st.rain == null ? 0 : clamp01(st.rain / (RAIN_MAX[span] || 3));
+    var gh = 22 * rf;
+    var water = gh > 0.5
+      ? '<rect x="35.6" y="' + (34 - gh).toFixed(1) + '" width="6.8" height="' + gh.toFixed(1) + '" rx="1.2" fill="#1a6fd6"/>'
+      : '';
+    var gauge =
+      '<path d="M29 4h20l-6 8H35z" fill="#5a6878"/>' +
+      '<rect x="34" y="11" width="10" height="24" rx="2.5" fill="#ffffff" stroke="#5a6878" stroke-width="1.6"/>' +
+      water +
+      '<line x1="41" y1="15" x2="37.5" y2="15" stroke="#5a6878" stroke-width="1.2"/>' +
+      '<line x1="41" y1="19" x2="38.5" y2="19" stroke="#5a6878" stroke-width="1.2"/>' +
+      '<line x1="41" y1="23" x2="37.5" y2="23" stroke="#5a6878" stroke-width="1.2"/>' +
+      '<line x1="41" y1="27" x2="38.5" y2="27" stroke="#5a6878" stroke-width="1.2"/>' +
+      '<line x1="41" y1="31" x2="37.5" y2="31" stroke="#5a6878" stroke-width="1.2"/>';
+    // windsock (right) — lifts from drooping to horizontal by wind
+    var wf = st.windAvg == null ? 0 : clamp01(st.windAvg / WIND_MAX_MPH);
+    var px = 58, py = 9;
+    var rot = (90 * (1 - wf)).toFixed(1);
+    var sock =
+      '<line x1="' + px + '" y1="5" x2="' + px + '" y2="35" stroke="#5a6878" stroke-width="2" stroke-linecap="round"/>' +
+      '<g transform="rotate(' + rot + ' ' + px + ' ' + py + ')">' +
+      '<path d="M' + px + ' ' + (py - 3.2) + ' L' + (px + 15) + ' ' + (py - 1.4) + ' L' + (px + 15) + ' ' + (py + 1.4) + ' L' + px + ' ' + (py + 3.2) + ' Z" fill="#e8862e"/>' +
+      '<rect x="' + (px + 5) + '" y="' + (py - 2.6) + '" width="3" height="5.2" fill="#ffffff" opacity="0.85"/>' +
+      '</g>' +
+      '<circle cx="' + px + '" cy="' + py + '" r="1.6" fill="#5a6878"/>';
+    return '<svg width="76" height="40" viewBox="0 0 76 40" xmlns="http://www.w3.org/2000/svg">' +
+      thermo + gauge + sock + '</svg>';
+  }
+  function stationIcon(st, span) {
+    return L.divIcon({
+      html: markerSvg(st, span),
+      className: 'gauge-marker',
+      iconSize: [76, 40],
+      iconAnchor: [39, 37],
+      popupAnchor: [0, -35],
+      tooltipAnchor: [0, -35],
+    });
+  }
   try {
     const res = await fetch('/api/stations/coords?pws=' + encodeURIComponent(ids.join(',')));
     const stations = await res.json();
     if (!Array.isArray(stations) || stations.length === 0) return;
+    const fmtRain = (v) => v == null ? '—' : v.toFixed(2) + '"';
+    const fmtTemp = (v) => v == null ? '—' : Math.round(v) + '°';
+    const fmtWind = (v) => v == null ? '—' : Math.round(v) + ' mph';
+    const dashUrl = (s) => '/pws/' + encodeURIComponent(s.id) + '/dashboard';
+    const statsFor = (s, span) => (s.stats && s.stats[span]) || EMPTY_STATS;
+    const tipHtml = (s, span) => {
+      const st = statsFor(s, span);
+      return '<a class="gauge-tip" href="' + dashUrl(s) + '"><strong>' + (labelById[s.id] || s.id) + '</strong>' +
+        '<span class="gauge-tip-stats">' + fmtRain(st.rain) + ' · ' + fmtTemp(st.tempAvg) + ' · ' + fmtWind(st.windAvg) + '</span></a>';
+    };
+    let span = 'week';
     const markers = stations.map((s) =>
-      L.marker([s.lat, s.lon])
-        .bindPopup('<strong>' + (labelById[s.id] || s.id) + '</strong><br><a href="/pws/' + encodeURIComponent(s.id) + '/dashboard">Dashboard</a>')
+      L.marker([s.lat, s.lon], { icon: stationIcon(statsFor(s, span), span) })
+        .on('click', () => { window.location.href = dashUrl(s); })
+        .bindTooltip(tipHtml(s, span), { permanent: true, direction: 'top', interactive: true })
         .addTo(map),
     );
+    const applySpan = (next) => {
+      span = next;
+      stations.forEach((s, i) => {
+        markers[i].setIcon(stationIcon(statsFor(s, span), span));
+        markers[i].setTooltipContent(tipHtml(s, span));
+      });
+    };
+    document.querySelectorAll('input[name="map-span"]').forEach((radio) => {
+      radio.addEventListener('change', () => { if (radio.checked) applySpan(radio.value); });
+    });
     if (markers.length === 1) {
       map.setView(markers[0].getLatLng(), 11);
     } else {
@@ -2353,6 +2547,11 @@ function renderHomePage(stations: PwsStation[]): string {
 		: '';
 	const body = hasIds
 		? `<div id="map"></div>
+    <div class="span-select" role="group" aria-label="Map data timespan">
+      <label><input type="radio" name="map-span" value="current"> Current</label>
+      <label><input type="radio" name="map-span" value="day"> 24 hr</label>
+      <label><input type="radio" name="map-span" value="week" checked> 7 days</label>
+    </div>
     ${rainLinks}
     <p>Personal Weather Stations:</p>
     <ul>${links}</ul>`
