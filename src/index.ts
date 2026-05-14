@@ -13,6 +13,10 @@
  *   /[?pws=K1,K2]              - Station index (placeholder when no pws param)
  *   /rain[/<spec>]?pws=K1,K2   - Rain page for the listed stations
  *   /api/stations/coords?pws=K1,K2 - Coords JSON for the listed stations
+ *
+ * The `pws` param accepts bare IDs or `Label:ID` pairs, comma-separated, and may
+ * be repeated (?pws=Alice:K1&pws=Bob:K2). Labels are shown in place of the raw
+ * station ID on the home and rain pages.
  *   /pws/<stationId>           - Redirects to /pws/<stationId>/dashboard
  *   /pws/<stationId>/dashboard            - Per-station dashboard
  *   /pws/<stationId>/rain[/<spec>]        - Rainfall page; spec ∈ today (default) | yesterday | YYYY-MM-DD
@@ -231,8 +235,8 @@ export default {
 
 		// Home page — placeholder unless ?pws=K1,K2 supplied
 		if (url.pathname === '/') {
-			const stationIds = parsePwsParam(url.searchParams.get('pws'));
-			return new Response(renderHomePage(stationIds), {
+			const stations = parsePwsParam(url.searchParams.getAll('pws'));
+			return new Response(renderHomePage(stations), {
 				headers: { 'Content-Type': 'text/html; charset=utf-8' },
 			});
 		}
@@ -247,8 +251,8 @@ export default {
 		const allRainMatch = /^\/rain(?:\/([^/]+))?\/?$/.exec(url.pathname);
 		if (allRainMatch) {
 			const spec = allRainMatch[1] ? decodeURIComponent(allRainMatch[1]) : 'today';
-			const stationIds = parsePwsParam(url.searchParams.get('pws'));
-			if (stationIds.length === 0) {
+			const pwsStations = parsePwsParam(url.searchParams.getAll('pws'));
+			if (pwsStations.length === 0) {
 				return new Response('Missing ?pws=K1,K2 query parameter.', { status: 400 });
 			}
 			const { WU_API_KEY } = weatherConfig(env);
@@ -256,7 +260,7 @@ export default {
 				return new Response('Missing WU_API_KEY configuration.', { status: 500 });
 			}
 			try {
-				const stations = await Promise.all(stationIds.map(async (stationId) => {
+				const stations = await Promise.all(pwsStations.map(async ({ id: stationId, label }) => {
 					const dashboard = await buildDashboard(env, stationId);
 					const target = resolveRainTarget(dashboard, spec);
 					if ('error' in target) return { error: target.error, stationId };
@@ -264,7 +268,7 @@ export default {
 						loadRainfallForDate(env, stationId, dashboard, target.date, target.isToday),
 						fetchNeighborRainfallForDate(env, stationId, target.date),
 					]);
-					return { stationId, dashboard, target, rainfall, neighborRain };
+					return { stationId, label, dashboard, target, rainfall, neighborRain };
 				}));
 				const firstError = stations.find((s): s is { error: string; stationId: string } => 'error' in s);
 				if (firstError) return new Response(firstError.error, { status: 400 });
@@ -339,14 +343,14 @@ export default {
 
 		// API routes
 		if (url.pathname === '/api/stations/coords') {
-			const stationIds = parsePwsParam(url.searchParams.get('pws'));
-			if (stationIds.length === 0) {
+			const pwsStations = parsePwsParam(url.searchParams.getAll('pws'));
+			if (pwsStations.length === 0) {
 				return new Response(JSON.stringify({ error: 'Missing ?pws=K1,K2 query parameter.' }), {
 					status: 400,
 					headers: { 'Content-Type': 'application/json' },
 				});
 			}
-			const coords = await getStationCoordsList(env, stationIds);
+			const coords = await getStationCoordsList(env, pwsStations.map((s) => s.id));
 			return new Response(JSON.stringify(coords), {
 				headers: { 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=300' },
 			});
@@ -685,18 +689,33 @@ async function getStationCoordsList(env: Env, stationIds: string[]): Promise<Sta
 }
 
 const PWS_ID_RE = /^[A-Za-z0-9]{3,32}$/;
-function parsePwsParam(raw: string | null): string[] {
-	if (!raw) return [];
+export interface PwsStation {
+	id: string;
+	label?: string;
+}
+
+function pwsDisplayName(s: PwsStation): string {
+	return s.label ?? s.id;
+}
+
+function pwsParamValue(stations: PwsStation[]): string {
+	return stations.map((s) => (s.label ? `${s.label}:${s.id}` : s.id)).join(',');
+}
+
+export function parsePwsParam(raw: string[]): PwsStation[] {
+	const out: PwsStation[] = [];
 	const seen = new Set<string>();
-	const out: string[] = [];
-	for (const piece of raw.split(',')) {
-		const trimmed = piece.trim();
-		if (!trimmed || !PWS_ID_RE.test(trimmed)) continue;
-		const upper = trimmed.toUpperCase();
-		if (seen.has(upper)) continue;
-		seen.add(upper);
-		out.push(upper);
-		if (out.length >= 32) break;
+	for (const value of raw) {
+		for (const piece of value.split(',')) {
+			const colon = piece.lastIndexOf(':');
+			const id = (colon >= 0 ? piece.slice(colon + 1) : piece).trim().toUpperCase();
+			const label = colon >= 0 ? piece.slice(0, colon).trim() : '';
+			if (!PWS_ID_RE.test(id)) continue;
+			if (seen.has(id)) continue;
+			seen.add(id);
+			out.push(label ? { id, label } : { id });
+			if (out.length >= 32) return out;
+		}
 	}
 	return out;
 }
@@ -2283,14 +2302,17 @@ const STATION_MAP_STYLES = `#map { height: 60vh; min-height: 420px; width: 100%;
 .leaflet-container { background: #eef2f7; }
 .leaflet-popup-content a { color: #1a6fd6; }`;
 
-function stationMapInitScript(stationIds: string[]): string {
-	const idsJson = safeScriptJson(stationIds);
+function stationMapInitScript(stations: PwsStation[]): string {
+	const stationsJson = safeScriptJson(stations);
 	return `<script>
 (async function () {
   const el = document.getElementById('map');
   if (!el || typeof L === 'undefined') return;
-  const ids = ${idsJson};
-  if (!Array.isArray(ids) || ids.length === 0) return;
+  const stationList = ${stationsJson};
+  if (!Array.isArray(stationList) || stationList.length === 0) return;
+  const ids = stationList.map((s) => s.id);
+  const labelById = {};
+  for (const s of stationList) labelById[s.id] = s.label || s.id;
   const map = L.map(el, { zoomControl: true, attributionControl: true });
   L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', {
     maxZoom: 19,
@@ -2304,7 +2326,7 @@ function stationMapInitScript(stationIds: string[]): string {
     if (!Array.isArray(stations) || stations.length === 0) return;
     const markers = stations.map((s) =>
       L.marker([s.lat, s.lon])
-        .bindPopup('<strong>' + s.id + '</strong><br><a href="/pws/' + encodeURIComponent(s.id) + '/dashboard">Dashboard</a>')
+        .bindPopup('<strong>' + (labelById[s.id] || s.id) + '</strong><br><a href="/pws/' + encodeURIComponent(s.id) + '/dashboard">Dashboard</a>')
         .addTo(map),
     );
     if (markers.length === 1) {
@@ -2320,12 +2342,12 @@ function stationMapInitScript(stationIds: string[]): string {
 </script>`;
 }
 
-function renderHomePage(stationIds: string[]): string {
-	const hasIds = stationIds.length > 0;
-	const links = stationIds.map((id) =>
-		'<li><a href="/pws/' + escHtml(id) + '/dashboard">' + escHtml(id) + '</a></li>'
+function renderHomePage(stations: PwsStation[]): string {
+	const hasIds = stations.length > 0;
+	const links = stations.map((s) =>
+		'<li><a href="/pws/' + escHtml(s.id) + '/dashboard">' + escHtml(pwsDisplayName(s)) + '</a></li>'
 	).join('');
-	const pwsParam = encodeURIComponent(stationIds.join(','));
+	const pwsParam = encodeURIComponent(pwsParamValue(stations));
 	const rainLinks = hasIds
 		? `<p><a href="/rain/today?pws=${pwsParam}">Rain — listed stations (today)</a> · <a href="/rain/yesterday?pws=${pwsParam}">yesterday</a></p>`
 		: '';
@@ -2360,7 +2382,7 @@ ${hasIds ? STATION_MAP_HEAD : ''}
     <h1>Weather Dashboard</h1>
     ${body}
   </div>
-${hasIds ? stationMapInitScript(stationIds) : ''}
+${hasIds ? stationMapInitScript(stations) : ''}
 </body>
 </html>`;
 }
@@ -2553,6 +2575,7 @@ ${STATION_MAP_HEAD}
 
 interface MultiRainEntry {
 	stationId: string;
+	label?: string;
 	dashboard: DashboardData;
 	target: RainTarget;
 	rainfall: number | null;
@@ -2646,7 +2669,7 @@ ${STATION_MAP_HEAD}
     const m = L.circleMarker([p.lat, p.lon], {
       radius: 11, color: '#ffffff', weight: 2, fillColor: '#d83737', fillOpacity: 0.75, opacity: 0.9,
     })
-      .bindPopup('<strong>' + p.id + '</strong> (primary)<br>Rain: ' + fmtRain(p.rainfall) + '<br><a href="/pws/' + encodeURIComponent(p.id) + '/rain' + (data.specPath || '') + '">Station rain page →</a>')
+      .bindPopup('<strong>' + (p.label || p.id) + '</strong> (primary)<br>Rain: ' + fmtRain(p.rainfall) + '<br><a href="/pws/' + encodeURIComponent(p.id) + '/rain' + (data.specPath || '') + '">Station rain page →</a>')
       .addTo(map);
     m.bringToFront();
     layers.push(m);
@@ -2695,7 +2718,7 @@ function renderStationRainCard(e: MultiRainEntry): string {
 		: '';
 
 	return `<div class="station-card">
-    <h2>${escHtml(stationId)}</h2>
+    <h2>${escHtml(e.label ?? stationId)}</h2>
     ${answer}
     ${summary}
     <table>
@@ -2707,7 +2730,7 @@ function renderStationRainCard(e: MultiRainEntry): string {
 }
 
 interface AllRainMapData {
-	primaries: Array<{ id: string; lat: number | null; lon: number | null; rainfall: number | null }>;
+	primaries: Array<{ id: string; label?: string; lat: number | null; lon: number | null; rainfall: number | null }>;
 	neighbors: Array<{ id: string; lat: number | null; lon: number | null; rainfall: number | null }>;
 	specPath: string;
 }
@@ -2720,6 +2743,7 @@ function buildAllRainMapData(entries: MultiRainEntry[], neighbors: NeighborsFile
 		const entry = neighbors.stations[e.stationId];
 		primaries.push({
 			id: e.stationId,
+			label: e.label,
 			lat: entry?.lat ?? null,
 			lon: entry?.lon ?? null,
 			rainfall: e.rainfall,
