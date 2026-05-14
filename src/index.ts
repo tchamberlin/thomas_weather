@@ -251,10 +251,11 @@ export default {
 			return env.ASSETS.fetch(req);
 		}
 
-		// Home page — placeholder unless ?pws=K1,K2 supplied
+		// Home page — static shell; the station list is hydrated client-side
+		// from the localStorage manifest. Any ?pws= param is consumed by the
+		// client store script, which then redirects to a clean "/".
 		if (url.pathname === '/') {
-			const stations = parsePwsParam(url.searchParams.getAll('pws'));
-			return new Response(renderHomePage(stations), {
+			return new Response(renderHomePage(), {
 				headers: { 'Content-Type': 'text/html; charset=utf-8' },
 			});
 		}
@@ -862,14 +863,6 @@ const PWS_ID_RE = /^[A-Za-z0-9]{3,32}$/;
 export interface PwsStation {
 	id: string;
 	label?: string;
-}
-
-function pwsDisplayName(s: PwsStation): string {
-	return s.label ?? s.id;
-}
-
-function pwsParamValue(stations: PwsStation[]): string {
-	return stations.map((s) => (s.label ? `${s.label}:${s.id}` : s.id)).join(',');
 }
 
 export function parsePwsParam(raw: string[]): PwsStation[] {
@@ -1922,7 +1915,7 @@ function renderDashboard(d: DashboardData, includeLiveReload: boolean): string {
 <main>
   <header>
     <div>
-      <h1>${escHtml(d.stationId)}</h1>
+      <h1 data-pws-id="${escHtml(d.stationId)}">${escHtml(d.stationId)}</h1>
       <div class="subtitle">Temperature, rain, wind avg, and gusts</div>
     </div>
     <div class="meta">
@@ -2363,6 +2356,7 @@ function renderDashboard(d: DashboardData, includeLiveReload: boolean): string {
   load();
 })();
 </script>
+${PWS_STORE_SCRIPT}
 ${liveReloadScript}
 </body>
 	</html>`;
@@ -2472,6 +2466,116 @@ function fmtTempRange(day: DailyWeather | null | undefined): string {
 const STATION_MAP_HEAD = `<link rel="stylesheet" href="/vendor/leaflet/leaflet.css">
 <script src="/vendor/leaflet/leaflet.js"></script>`;
 
+// Client-side PWS store. localStorage holds the manifest of "my stations" as
+// [{id, label?}]. Any ?pws= param is treated purely as a loader: it upserts
+// into the manifest (an incoming label overwrites a stored one; a bare id never
+// clobbers an existing label) and is then stripped from the URL. On the home
+// page that means a redirect to "/"; elsewhere the bare ids are kept so the
+// server can still resolve the page. window.PwsStore exposes the manifest plus
+// displayName(id) -> "Label (ID)" and decorate(), which rewrites every
+// [data-pws-id] element to its display name.
+const PWS_STORE_SCRIPT = `<script>
+(function () {
+  var KEY = 'pwsStations';
+  var ID_RE = /^[A-Za-z0-9]{3,32}$/;
+  function read() {
+    try {
+      var arr = JSON.parse(localStorage.getItem(KEY) || '[]');
+      if (!Array.isArray(arr)) return [];
+      return arr
+        .filter(function (s) { return s && typeof s.id === 'string' && ID_RE.test(s.id); })
+        .map(function (s) { return s.label ? { id: s.id, label: String(s.label) } : { id: s.id }; });
+    } catch (e) { return []; }
+  }
+  function write(list) {
+    try { localStorage.setItem(KEY, JSON.stringify(list)); } catch (e) {}
+  }
+  function parseParam(values) {
+    var out = [], seen = {};
+    for (var i = 0; i < values.length; i++) {
+      var pieces = values[i].split(',');
+      for (var j = 0; j < pieces.length; j++) {
+        var piece = pieces[j];
+        var colon = piece.lastIndexOf(':');
+        var id = (colon >= 0 ? piece.slice(colon + 1) : piece).trim().toUpperCase();
+        var label = colon >= 0 ? piece.slice(0, colon).trim() : '';
+        if (!ID_RE.test(id) || seen[id]) continue;
+        seen[id] = 1;
+        out.push(label ? { id: id, label: label } : { id: id });
+        if (out.length >= 32) return out;
+      }
+    }
+    return out;
+  }
+  function merge(stored, incoming) {
+    var byId = {}, order = [];
+    for (var i = 0; i < stored.length; i++) { byId[stored[i].id] = stored[i]; order.push(stored[i].id); }
+    for (var k = 0; k < incoming.length; k++) {
+      var inc = incoming[k];
+      if (byId[inc.id]) {
+        if (inc.label) byId[inc.id] = { id: inc.id, label: inc.label };
+      } else {
+        byId[inc.id] = inc;
+        order.push(inc.id);
+      }
+    }
+    return order.map(function (id) { return byId[id]; });
+  }
+  var params = new URLSearchParams(location.search);
+  var rawPws = params.getAll('pws');
+  var redirected = false;
+  if (rawPws.length) {
+    var incoming = parseParam(rawPws);
+    if (incoming.length) write(merge(read(), incoming));
+    if (location.pathname === '/') {
+      location.replace('/');
+      redirected = true;
+    } else if (incoming.some(function (s) { return !!s.label; })) {
+      // keep the page working but drop the "ugly" Label: prefixes from the bar
+      params.delete('pws');
+      params.append('pws', incoming.map(function (s) { return s.id; }).join(','));
+      history.replaceState(null, '', location.pathname + '?' + params.toString());
+    }
+  }
+  var store = read();
+  function labelFor(id) {
+    id = String(id || '').toUpperCase();
+    for (var i = 0; i < store.length; i++) if (store[i].id === id) return store[i].label || null;
+    return null;
+  }
+  function displayName(id) {
+    id = String(id || '').toUpperCase();
+    var l = labelFor(id);
+    return l ? l + ' (' + id + ')' : id;
+  }
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+  // safe for innerHTML/leaflet popups — labels come from the URL, so escape them
+  function displayNameHtml(id) { return escapeHtml(displayName(id)); }
+  function decorate(root) {
+    (root || document).querySelectorAll('[data-pws-id]').forEach(function (el) {
+      var id = (el.getAttribute('data-pws-id') || '').toUpperCase();
+      if (id) el.textContent = displayName(id);
+    });
+  }
+  window.PwsStore = {
+    all: function () { return store.slice(); },
+    labelFor: labelFor,
+    displayName: displayName,
+    displayNameHtml: displayNameHtml,
+    decorate: decorate,
+    redirected: redirected,
+  };
+  if (!redirected) {
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', function () { decorate(); });
+    else decorate();
+  }
+})();
+</script>`;
+
 const STATION_MAP_STYLES = `#map { height: 60vh; min-height: 420px; width: 100%; border-radius: 8px; background: #eef2f7; }
 .leaflet-container { background: #eef2f7; }
 .leaflet-popup-content a { color: #1a6fd6; }
@@ -2487,17 +2591,43 @@ const STATION_MAP_STYLES = `#map { height: 60vh; min-height: 420px; width: 100%;
 .span-select label:has(input:checked) { background: #0e7fcf; color: #fff; border-color: #0e7fcf; }
 .span-select input { position: absolute; opacity: 0; pointer-events: none; }`;
 
-function stationMapInitScript(stations: PwsStation[]): string {
-	const stationsJson = safeScriptJson(stations);
+// Home page bootstrap: renders the station list, rain links and map entirely
+// from the localStorage manifest (window.PwsStore). The server ships an empty
+// shell — there are no ?pws= params by the time this runs.
+function homeInitScript(): string {
 	return `<script>
 (async function () {
+  if (!window.PwsStore || window.PwsStore.redirected) return;
+  const stationList = window.PwsStore.all();
+  const content = document.getElementById('pws-content');
+  const empty = document.getElementById('pws-empty');
+  if (!stationList.length) { if (empty) empty.hidden = false; return; }
+  if (content) content.hidden = false;
+  const ids = stationList.map((s) => s.id);
+
+  // station list
+  const ul = document.getElementById('pws-list');
+  for (const s of stationList) {
+    const li = document.createElement('li');
+    const a = document.createElement('a');
+    a.href = '/pws/' + encodeURIComponent(s.id) + '/dashboard';
+    a.setAttribute('data-pws-id', s.id);
+    a.textContent = window.PwsStore.displayName(s.id);
+    li.appendChild(a);
+    ul.appendChild(li);
+  }
+
+  // rain links (bare ids — labels live in localStorage, not the URL)
+  const pwsParam = encodeURIComponent(ids.join(','));
+  const rainLinks = document.getElementById('rain-links');
+  if (rainLinks) {
+    rainLinks.innerHTML = '<a href="/rain/today?pws=' + pwsParam + '">Rain — listed stations (today)</a> · ' +
+      '<a href="/rain/yesterday?pws=' + pwsParam + '">yesterday</a>';
+  }
+
+  // map
   const el = document.getElementById('map');
   if (!el || typeof L === 'undefined') return;
-  const stationList = ${stationsJson};
-  if (!Array.isArray(stationList) || stationList.length === 0) return;
-  const ids = stationList.map((s) => s.id);
-  const labelById = {};
-  for (const s of stationList) labelById[s.id] = s.label || s.id;
   const map = L.map(el, { zoomControl: true, attributionControl: true });
   L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', {
     maxZoom: 19,
@@ -2572,7 +2702,7 @@ function stationMapInitScript(stations: PwsStation[]): string {
     const statsFor = (s, span) => (s.stats && s.stats[span]) || EMPTY_STATS;
     const tipHtml = (s, span) => {
       const st = statsFor(s, span);
-      return '<a class="gauge-tip" href="' + dashUrl(s) + '"><strong>' + (labelById[s.id] || s.id) + '</strong>' +
+      return '<a class="gauge-tip" href="' + dashUrl(s) + '"><strong>' + window.PwsStore.displayNameHtml(s.id) + '</strong>' +
         '<span class="gauge-tip-stats">' + fmtRain(st.rain) + ' · ' + fmtTemp(st.tempAvg) + ' · ' + fmtWind(st.windAvg) + '</span></a>';
     };
     let span = 'week';
@@ -2605,32 +2735,14 @@ function stationMapInitScript(stations: PwsStation[]): string {
 </script>`;
 }
 
-function renderHomePage(stations: PwsStation[]): string {
-	const hasIds = stations.length > 0;
-	const links = stations.map((s) =>
-		'<li><a href="/pws/' + escHtml(s.id) + '/dashboard">' + escHtml(pwsDisplayName(s)) + '</a></li>'
-	).join('');
-	const pwsParam = encodeURIComponent(pwsParamValue(stations));
-	const rainLinks = hasIds
-		? `<p><a href="/rain/today?pws=${pwsParam}">Rain — listed stations (today)</a> · <a href="/rain/yesterday?pws=${pwsParam}">yesterday</a></p>`
-		: '';
-	const body = hasIds
-		? `<div id="map"></div>
-    <div class="span-select" role="group" aria-label="Map data timespan">
-      <label><input type="radio" name="map-span" value="current"> Current</label>
-      <label><input type="radio" name="map-span" value="day"> 24 hr</label>
-      <label><input type="radio" name="map-span" value="week" checked> 7 days</label>
-    </div>
-    ${rainLinks}
-    <p>Personal Weather Stations:</p>
-    <ul>${links}</ul>`
-		: `<p class="empty">Append <code>?pws=K1,K2,K3</code> to view dashboards for one or more PWS station IDs, or visit <code>/pws/&lt;id&gt;/dashboard</code> directly.</p>`;
-
+// The home page is a static shell: the station list, rain links and map are
+// all populated client-side from the localStorage manifest by homeInitScript().
+function renderHomePage(): string {
 	return `<!DOCTYPE html>
 <html lang="en">
 <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Weather Stations</title>
-${hasIds ? STATION_MAP_HEAD : ''}
+${STATION_MAP_HEAD}
 <style>
   *, *::before, *::after { box-sizing: border-box; }
   html, body { margin: 0; padding: 0; }
@@ -2642,15 +2754,28 @@ ${hasIds ? STATION_MAP_HEAD : ''}
   ul { line-height: 2; }
   code { background: #eef2f7; padding: 2px 6px; border-radius: 4px; }
   .empty { color: #5a6878; }
-  ${hasIds ? STATION_MAP_STYLES : ''}
+  [hidden] { display: none !important; }
+  ${STATION_MAP_STYLES}
 </style>
 </head>
 <body>
   <div class="wrap">
     <h1>Weather Dashboard</h1>
-    ${body}
+    <div id="pws-content" hidden>
+      <div id="map"></div>
+      <div class="span-select" role="group" aria-label="Map data timespan">
+        <label><input type="radio" name="map-span" value="current"> Current</label>
+        <label><input type="radio" name="map-span" value="day"> 24 hr</label>
+        <label><input type="radio" name="map-span" value="week" checked> 7 days</label>
+      </div>
+      <p id="rain-links"></p>
+      <p>Personal Weather Stations:</p>
+      <ul id="pws-list"></ul>
+    </div>
+    <p id="pws-empty" class="empty" hidden>Append <code>?pws=Label:K1,Label:K2</code> to register one or more PWS station IDs (with optional custom names). They are saved to this browser, so plain <code>/</code> shows them next time. Or visit <code>/pws/&lt;id&gt;/dashboard</code> directly.</p>
   </div>
-${hasIds ? stationMapInitScript(stations) : ''}
+${PWS_STORE_SCRIPT}
+${homeInitScript()}
 </body>
 </html>`;
 }
@@ -2681,9 +2806,10 @@ function renderRainPage(
 		: target.isYesterday
 			? 'How much did it rain yesterday?'
 			: `How much did it rain on ${prettyDate}?`;
+	const stationSpan = `<span data-pws-id="${escHtml(d.stationId)}">${escHtml(d.stationId)}</span>`;
 	const dateLine = target.isToday
-		? `${prettyDate} (so far) at ${d.stationId}`
-		: `${prettyDate} at ${d.stationId}`;
+		? `${escHtml(prettyDate)} (so far) at ${stationSpan}`
+		: `${escHtml(prettyDate)} at ${stationSpan}`;
 	const titleVerb = target.isToday ? "Today's" : target.isYesterday ? "Yesterday's" : prettyDate;
 
 	const all: Array<{ id: string; name: string | null; distanceMi: number | null; rainfall: number; isPrimary: boolean }> = [];
@@ -2705,7 +2831,7 @@ function renderRainPage(
 		.map((s) => {
 			const cls = s.isPrimary ? ' class="you"' : '';
 			const dist = s.isPrimary ? 'you' : s.distanceMi !== null ? `${s.distanceMi.toFixed(2)} mi` : '—';
-			return `<tr${cls}><td>${escHtml(dist)}</td><td>${escHtml(s.id)}</td><td>${escHtml(s.rainfall.toFixed(2))}"</td></tr>`;
+			return `<tr${cls}><td>${escHtml(dist)}</td><td data-pws-id="${escHtml(s.id)}">${escHtml(s.id)}</td><td>${escHtml(s.rainfall.toFixed(2))}"</td></tr>`;
 		})
 		.join('');
 
@@ -2781,7 +2907,7 @@ ${STATION_MAP_HEAD}
 <body>
 <main>
   <h1>${escHtml(heading)}</h1>
-  <div class="date">${escHtml(dateLine)}</div>
+  <div class="date">${dateLine}</div>
   ${rainfall !== null
 		? `<div class="answer">${escHtml(rainfall.toFixed(2))}"</div><div class="unit">inches</div>`
 		: `<div class="none">No data available</div>`
@@ -2794,6 +2920,7 @@ ${STATION_MAP_HEAD}
     <a href="/pws/${escHtml(d.stationId)}/dashboard">Full dashboard →</a>
   </div>
 </main>
+${PWS_STORE_SCRIPT}
 <script id="rain-map-data" type="application/json">${safeScriptJson(buildRainMapData(d.stationId, rainfall, neighborRain, neighbors))}</script>
 <script>
 (function () {
@@ -2817,7 +2944,7 @@ ${STATION_MAP_HEAD}
       L.circleMarker([n.lat, n.lon], {
         radius: 7, color: '#ffffff', weight: 1.5, fillColor: '#1a6fd6', fillOpacity: 0.55, opacity: 0.7,
       })
-        .bindPopup('<strong>' + n.id + '</strong><br>' + (n.distanceMi != null ? n.distanceMi.toFixed(2) + ' mi away<br>' : '') + 'Rain: ' + fmtRain(n.rainfall))
+        .bindPopup('<strong>' + window.PwsStore.displayNameHtml(n.id) + '</strong><br>' + (n.distanceMi != null ? n.distanceMi.toFixed(2) + ' mi away<br>' : '') + 'Rain: ' + fmtRain(n.rainfall))
         .addTo(map),
     );
   }
@@ -2825,7 +2952,7 @@ ${STATION_MAP_HEAD}
     const m = L.circleMarker([data.primary.lat, data.primary.lon], {
       radius: 11, color: '#ffffff', weight: 2, fillColor: '#d83737', fillOpacity: 0.75, opacity: 0.9,
     })
-      .bindPopup('<strong>' + data.primary.id + '</strong> (you)<br>Rain: ' + fmtRain(data.primary.rainfall))
+      .bindPopup('<strong>' + window.PwsStore.displayNameHtml(data.primary.id) + '</strong> (you)<br>Rain: ' + fmtRain(data.primary.rainfall))
       .addTo(map);
     m.bringToFront();
     layers.push(m);
@@ -2905,6 +3032,7 @@ ${STATION_MAP_HEAD}
   <div class="map-section"><div id="map"></div></div>
   <div class="stations-row">${cards}</div>
 </main>
+${PWS_STORE_SCRIPT}
 <script id="all-rain-map-data" type="application/json">${safeScriptJson(buildAllRainMapData(entries, neighbors))}</script>
 <script>
 (function () {
@@ -2928,7 +3056,7 @@ ${STATION_MAP_HEAD}
       L.circleMarker([n.lat, n.lon], {
         radius: 7, color: '#ffffff', weight: 1.5, fillColor: '#1a6fd6', fillOpacity: 0.55, opacity: 0.7,
       })
-        .bindPopup('<strong>' + n.id + '</strong><br>Rain: ' + fmtRain(n.rainfall))
+        .bindPopup('<strong>' + window.PwsStore.displayNameHtml(n.id) + '</strong><br>Rain: ' + fmtRain(n.rainfall))
         .addTo(map),
     );
   }
@@ -2937,7 +3065,7 @@ ${STATION_MAP_HEAD}
     const m = L.circleMarker([p.lat, p.lon], {
       radius: 11, color: '#ffffff', weight: 2, fillColor: '#d83737', fillOpacity: 0.75, opacity: 0.9,
     })
-      .bindPopup('<strong>' + (p.label || p.id) + '</strong> (primary)<br>Rain: ' + fmtRain(p.rainfall) + '<br><a href="/pws/' + encodeURIComponent(p.id) + '/rain' + (data.specPath || '') + '">Station rain page →</a>')
+      .bindPopup('<strong>' + window.PwsStore.displayNameHtml(p.id) + '</strong> (primary)<br>Rain: ' + fmtRain(p.rainfall) + '<br><a href="/pws/' + encodeURIComponent(p.id) + '/rain' + (data.specPath || '') + '">Station rain page →</a>')
       .addTo(map);
     m.bringToFront();
     layers.push(m);
@@ -2974,7 +3102,7 @@ function renderStationRainCard(e: MultiRainEntry): string {
 		.map((s) => {
 			const cls = s.isPrimary ? ' class="you"' : '';
 			const dist = s.isPrimary ? 'you' : s.distanceMi !== null ? `${s.distanceMi.toFixed(2)} mi` : '—';
-			return `<tr${cls}><td>${escHtml(dist)}</td><td>${escHtml(s.id)}</td><td>${escHtml(s.rainfall.toFixed(2))}"</td></tr>`;
+			return `<tr${cls}><td>${escHtml(dist)}</td><td data-pws-id="${escHtml(s.id)}">${escHtml(s.id)}</td><td>${escHtml(s.rainfall.toFixed(2))}"</td></tr>`;
 		})
 		.join('');
 
@@ -2986,7 +3114,7 @@ function renderStationRainCard(e: MultiRainEntry): string {
 		: '';
 
 	return `<div class="station-card">
-    <h2>${escHtml(e.label ?? stationId)}</h2>
+    <h2 data-pws-id="${escHtml(stationId)}">${escHtml(e.label ?? stationId)}</h2>
     ${answer}
     ${summary}
     <table>
