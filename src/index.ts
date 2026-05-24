@@ -231,9 +231,126 @@ const HISTORY_BLOCK_DAYS = 31;
 // without making today's headline rainfall (driven by `current`) any staler.
 const PRIMARY_FULL_EVERY_N_TICKS = 4;
 
-// In-isolate dedup: skip KV PUTs when payload bytes match the last value we wrote.
-// Isolate restarts will re-PUT once; that's acceptable.
-const WRITE_DEDUP_CACHE = new Map<string, string>();
+// In-isolate dedup: skip KV PUTs when payload bytes match the last value we wrote
+// for that key. Isolate restarts will re-PUT once; that's acceptable. Shared by
+// the Station cache and the History block store, so the Write-dedup invariant
+// lives in exactly one function — putDeduped.
+const _stationDedup = new Map<string, string>();
+
+/**
+ * THE single place a KV write is suppressed (the Write-dedup invariant). Returns
+ * true when it actually wrote, false when the payload was byte-identical to this
+ * isolate's last write for the key — so callers with follow-on work (e.g. the
+ * history index) can skip it too.
+ */
+export async function putDeduped(
+	kv: KVNamespace,
+	dedup: Map<string, string>,
+	key: string,
+	payload: string,
+	metadata?: Record<string, unknown>,
+): Promise<boolean> {
+	if (dedup.get(key) === payload) return false;
+	await kv.put(key, payload, metadata ? { metadata } : undefined);
+	dedup.set(key, payload);
+	return true;
+}
+
+/**
+ * The Station cache: the single-value, id-keyed KV caches the cron writes and the
+ * request path reads (current observation, coords, daily summaries). Owns each
+ * cache's key, JSON shaping, metadata, write preconditions, and read parsing; the
+ * Write-dedup invariant is delegated to putDeduped. Constructed with a
+ * KVNamespace + dedup map so an in-memory fake can stand in for tests.
+ */
+export interface StationCache {
+	current: {
+		read(id: string): Promise<{ value: WUCurrentObservation | null; lastWriteAt: string | null }>;
+		write(id: string, obs: WUCurrentObservation): Promise<void>;
+	};
+	coords: {
+		read(id: string): Promise<{ lat: number; lon: number } | null>;
+		/** No-ops unless the observation carries numeric lat/lon. */
+		write(id: string, obs: WUCurrentObservation): Promise<void>;
+	};
+	daily: {
+		read(id: string): Promise<DailyWeather[]>;
+		/** No-ops on an empty list. */
+		write(id: string, days: DailyWeather[]): Promise<void>;
+	};
+}
+
+export function createStationCache(kv: KVNamespace, dedup: Map<string, string>): StationCache {
+	return {
+		current: {
+			async read(id) {
+				// One read fetches both the value and the cron's `cachedAt` write stamp.
+				const { value, metadata } = await kv.getWithMetadata<{ cachedAt?: string }>(currentCacheKey(id));
+				const lastWriteAt = typeof metadata?.cachedAt === 'string' ? metadata.cachedAt : null;
+				if (!value) return { value: null, lastWriteAt };
+				try {
+					return { value: JSON.parse(value) as WUCurrentObservation, lastWriteAt };
+				} catch {
+					return { value: null, lastWriteAt };
+				}
+			},
+			async write(id, obs) {
+				await putDeduped(kv, dedup, currentCacheKey(id), JSON.stringify(obs), {
+					stationId: id,
+					cachedAt: new Date().toISOString(),
+				});
+			},
+		},
+		coords: {
+			async read(id) {
+				const raw = await kv.get(coordsCacheKey(id));
+				if (!raw) return null;
+				try {
+					const parsed = JSON.parse(raw) as { lat: number; lon: number };
+					if (typeof parsed.lat === 'number' && typeof parsed.lon === 'number') {
+						return { lat: parsed.lat, lon: parsed.lon };
+					}
+				} catch {}
+				return null;
+			},
+			async write(id, obs) {
+				if (typeof obs.lat !== 'number' || typeof obs.lon !== 'number') return;
+				await putDeduped(kv, dedup, coordsCacheKey(id), JSON.stringify({ lat: obs.lat, lon: obs.lon }));
+			},
+		},
+		daily: {
+			async read(id) {
+				const raw = await kv.get(dailySummariesCacheKey(id));
+				if (!raw) return [];
+				try {
+					const parsed: unknown = JSON.parse(raw);
+					if (!Array.isArray(parsed)) return [];
+					return parsed
+						.map((day) => normalizeCachedDay(day))
+						.filter((day): day is DailyWeather => day !== null)
+						.sort((a, b) => a.date.localeCompare(b.date));
+				} catch {
+					return [];
+				}
+			},
+			async write(id, days) {
+				if (days.length === 0) return;
+				await putDeduped(kv, dedup, dailySummariesCacheKey(id), JSON.stringify(days), {
+					stationId: id,
+					cachedAt: new Date().toISOString(),
+				});
+			},
+		},
+	};
+}
+
+// One Station cache per isolate: the dedup map persists across requests (bounding
+// writes against the KV budget) while kv is taken fresh from each invocation's
+// env — bindings are per-invocation in Workers, so we memoize the map, not the
+// binding.
+function getStationCache(env: Env): StationCache {
+	return createStationCache(env.WEATHER, _stationDedup);
+}
 // Marks (station, blockStart, blockEnd) tuples whose contribution is already reflected
 // in the history index for this isolate — lets updateHistoryIndex short-circuit without a GET.
 const HISTORY_INDEX_DONE = new Set<string>();
@@ -500,17 +617,11 @@ async function loadCurrent(
 	stationId: string,
 ): Promise<{ current: WUCurrentObservation | null; lastWriteAt: string | null; warning: string | null }> {
 	if (!env.WEATHER) return { current: null, lastWriteAt: null, warning: 'Current conditions unavailable (no KV).' };
-	// One read fetches both the value and the cron's `cachedAt` write stamp.
-	const { value, metadata } = await env.WEATHER.getWithMetadata<{ cachedAt?: string }>(currentCacheKey(stationId));
-	const lastWriteAt = typeof metadata?.cachedAt === 'string' ? metadata.cachedAt : null;
+	const { value, lastWriteAt } = await getStationCache(env).current.read(stationId);
 	if (!value) {
 		return { current: null, lastWriteAt, warning: 'Current conditions unavailable (not yet cached by the scheduled refresh).' };
 	}
-	try {
-		return { current: JSON.parse(value) as WUCurrentObservation, lastWriteAt, warning: null };
-	} catch {
-		return { current: null, lastWriteAt, warning: 'Current conditions unavailable (not yet cached by the scheduled refresh).' };
-	}
+	return { current: value, lastWriteAt, warning: null };
 }
 
 const CURRENT_PREFIX = 'weather:current:v1';
@@ -521,25 +632,13 @@ function currentCacheKey(stationId: string): string {
 
 async function readCachedCurrent(env: Env, stationId: string): Promise<WUCurrentObservation | null> {
 	if (!env.WEATHER) return null;
-	const raw = await env.WEATHER.get(currentCacheKey(stationId));
-	if (!raw) return null;
-	try {
-		return JSON.parse(raw) as WUCurrentObservation;
-	} catch {
-		return null;
-	}
+	return (await getStationCache(env).current.read(stationId)).value;
 }
 
 /** KV write only — no WU access. Caller supplies the observation from the cron's single fetch. */
 async function cacheCurrent(env: Env, stationId: string, current: WUCurrentObservation): Promise<void> {
 	if (!env.WEATHER) return;
-	const key = currentCacheKey(stationId);
-	const payload = JSON.stringify(current);
-	if (WRITE_DEDUP_CACHE.get(key) === payload) return;
-	await env.WEATHER.put(key, payload, {
-		metadata: { stationId, cachedAt: new Date().toISOString() },
-	});
-	WRITE_DEDUP_CACHE.set(key, payload);
+	await getStationCache(env).current.write(stationId, current);
 }
 
 async function fetchCurrent(wu: WuClient, stationId: string): Promise<WUCurrentObservation | null> {
@@ -790,15 +889,8 @@ function coordsCacheKey(stationId: string): string {
 // station with no cached coords is simply omitted from the response — the
 // request path never fetches WU to discover them.
 async function getStationCoords(env: Env, stationId: string): Promise<StationLatLon | null> {
-	const cached = await env.WEATHER.get(coordsCacheKey(stationId));
-	if (!cached) return null;
-	try {
-		const parsed = JSON.parse(cached) as { lat: number; lon: number };
-		if (typeof parsed.lat === 'number' && typeof parsed.lon === 'number') {
-			return { id: stationId, lat: parsed.lat, lon: parsed.lon };
-		}
-	} catch {}
-	return null;
+	const coords = await getStationCache(env).coords.read(stationId);
+	return coords ? { id: stationId, lat: coords.lat, lon: coords.lon } : null;
 }
 
 /**
@@ -812,12 +904,7 @@ async function getStationCoords(env: Env, stationId: string): Promise<StationLat
  */
 async function cacheStationCoords(env: Env, stationId: string, current: WUCurrentObservation): Promise<void> {
 	if (!env.WEATHER) return;
-	if (typeof current.lat !== 'number' || typeof current.lon !== 'number') return;
-	const key = coordsCacheKey(stationId);
-	const payload = JSON.stringify({ lat: current.lat, lon: current.lon });
-	if (WRITE_DEDUP_CACHE.get(key) === payload) return;
-	await env.WEATHER.put(key, payload);
-	WRITE_DEDUP_CACHE.set(key, payload);
+	await getStationCache(env).coords.write(stationId, current);
 }
 
 function meanOrNull(vals: Array<number | null>): number | null {
@@ -1187,23 +1274,17 @@ async function writeHistoryBlock(
 	records: number,
 ): Promise<void> {
 	if (!env.WEATHER) return;
-	if (WRITE_DEDUP_CACHE.get(kvKey) === rawJson) {
-		// Payload unchanged since this isolate's last write — skip the PUT and the
-		// downstream index update (which would also have no effect).
-		return;
-	}
-	await env.WEATHER.put(kvKey, rawJson, {
-		metadata: {
-			stationId: stationId,
-			endpoint: 'hourly',
-			startDate,
-			endDate,
-			records,
-			storedAt: new Date().toISOString(),
-		},
+	const wrote = await putDeduped(env.WEATHER, _stationDedup, kvKey, rawJson, {
+		stationId: stationId,
+		endpoint: 'hourly',
+		startDate,
+		endDate,
+		records,
+		storedAt: new Date().toISOString(),
 	});
-	WRITE_DEDUP_CACHE.set(kvKey, rawJson);
-	await updateHistoryIndex(env, stationId, startDate, endDate, records);
+	// Payload unchanged since this isolate's last write — skip the downstream index
+	// update too (it would have no effect on the covered range).
+	if (wrote) await updateHistoryIndex(env, stationId, startDate, endDate, records);
 }
 
 async function updateHistoryIndex(env: Env, stationId: string, startDate: string, endDate: string, records: number): Promise<void> {
@@ -1444,32 +1525,13 @@ async function loadDailySummaries(env: Env, stationId: string): Promise<{ days: 
 }
 
 async function cacheDailySummaries(env: Env, stationId: string, days: DailyWeather[]): Promise<void> {
-	if (!env.WEATHER || days.length === 0) return;
-	const key = dailySummariesCacheKey(stationId);
-	const payload = JSON.stringify(days);
-	if (WRITE_DEDUP_CACHE.get(key) === payload) return;
-	await env.WEATHER.put(key, payload, {
-		metadata: { stationId: stationId, cachedAt: new Date().toISOString() },
-	});
-	WRITE_DEDUP_CACHE.set(key, payload);
+	if (!env.WEATHER) return;
+	await getStationCache(env).daily.write(stationId, days);
 }
 
 async function readCachedDailySummaries(env: Env, stationId: string): Promise<DailyWeather[]> {
 	if (!env.WEATHER) return [];
-
-	const raw = await env.WEATHER.get(dailySummariesCacheKey(stationId));
-	if (!raw) return [];
-
-	try {
-		const parsed: unknown = JSON.parse(raw);
-		if (!Array.isArray(parsed)) return [];
-		return parsed
-			.map((day) => normalizeCachedDay(day))
-			.filter((day): day is DailyWeather => day !== null)
-			.sort((a, b) => a.date.localeCompare(b.date));
-	} catch {
-		return [];
-	}
+	return getStationCache(env).daily.read(stationId);
 }
 
 function dailySummariesCacheKey(stationId: string): string {
