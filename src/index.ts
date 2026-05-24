@@ -3009,6 +3009,71 @@ function fmtPrettyDate(ymd: string): string {
 	});
 }
 
+export interface RainfallStanding {
+	id: string;
+	distanceMi: number | null;
+	rainfall: number;
+	isPrimary: boolean;
+}
+
+export interface RainfallComparison {
+	/** Stations with a reading, highest rainfall first — drives rank and the "X of N" line. */
+	byRainfall: RainfallStanding[];
+	/** The same stations, nearest first — drives the comparison table rows. */
+	byDistance: RainfallStanding[];
+	/** The primary's 1-based rank by rainfall; 0 when the primary has no reading. */
+	rank: number;
+	/** How many stations have a reading (the N in "X of N"). */
+	count: number;
+	/** True median of the neighbour rainfalls (primary excluded); null when no neighbours have a reading. */
+	median: number | null;
+}
+
+// Ranks a primary station against its neighbours by rainfall for one date.
+// Stations without a reading are dropped; the primary sits at distance 0. Pure
+// and separated from rendering so the ranking, rank, and median are tested
+// directly rather than through generated HTML (test/rainfall-comparison.test.ts).
+export function compareRainfall(
+	primaryId: string,
+	primaryRainfall: number | null,
+	neighborRain: NeighborRainReading[],
+): RainfallComparison {
+	const standings: RainfallStanding[] = [];
+	if (primaryRainfall !== null) {
+		standings.push({ id: primaryId, distanceMi: 0, rainfall: primaryRainfall, isPrimary: true });
+	}
+	for (const n of neighborRain) {
+		if (n.rainfall !== null) {
+			standings.push({ id: n.stationId, distanceMi: n.distanceMi, rainfall: n.rainfall, isPrimary: false });
+		}
+	}
+	const byRainfall = [...standings].sort((a, b) => b.rainfall - a.rainfall);
+	const byDistance = [...standings].sort((a, b) => (a.distanceMi ?? 0) - (b.distanceMi ?? 0));
+	const neighborRainfalls = standings.filter((s) => !s.isPrimary).map((s) => s.rainfall);
+	return {
+		byRainfall,
+		byDistance,
+		rank: byRainfall.findIndex((s) => s.isPrimary) + 1,
+		count: standings.length,
+		median: medianOrNull(neighborRainfalls),
+	};
+}
+
+// True median: averages the two middle values for an even count.
+function medianOrNull(values: number[]): number | null {
+	if (values.length === 0) return null;
+	const sorted = [...values].sort((a, b) => a - b);
+	const mid = Math.floor(sorted.length / 2);
+	return sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid];
+}
+
+// One comparison-table row, shared by the single-station and multi-station pages.
+function renderStandingRow(s: RainfallStanding): string {
+	const cls = s.isPrimary ? ' class="you"' : '';
+	const dist = s.isPrimary ? 'you' : s.distanceMi !== null ? `${s.distanceMi.toFixed(2)} mi` : '—';
+	return `<tr${cls}><td>${escHtml(dist)}</td><td data-pws-id="${escHtml(s.id)}">${escHtml(s.id)}</td><td>${escHtml(s.rainfall.toFixed(2))}"</td></tr>`;
+}
+
 function renderRainPage(
 	d: DashboardData,
 	target: RainTarget,
@@ -3029,33 +3094,13 @@ function renderRainPage(
 		: `${escHtml(prettyDate)} at ${stationSpan}`;
 	const titleVerb = target.isToday ? "Today's" : target.isYesterday ? "Yesterday's" : prettyDate;
 
-	const all: Array<{ id: string; name: string | null; distanceMi: number | null; rainfall: number; isPrimary: boolean }> = [];
-	if (rainfall !== null) {
-		all.push({ id: d.stationId, name: null, distanceMi: 0, rainfall, isPrimary: true });
-	}
-	for (const n of neighborRain) {
-		if (n.rainfall !== null) {
-			all.push({ id: n.stationId, name: n.name, distanceMi: n.distanceMi, rainfall: n.rainfall, isPrimary: false });
-		}
-	}
-	const sorted = [...all].sort((a, b) => b.rainfall - a.rainfall);
-	const primaryRank = rainfall !== null ? sorted.findIndex((s) => s.isPrimary) + 1 : 0;
-	const others = sorted.filter((s) => !s.isPrimary).map((s) => s.rainfall);
-	const median = others.length > 0 ? others.slice().sort((a, b) => a - b)[Math.floor(others.length / 2)] : null;
+	const comparison = compareRainfall(d.stationId, rainfall, neighborRain);
+	const tableRows = comparison.byDistance.map(renderStandingRow).join('');
 
-	const tableRows = [...all]
-		.sort((a, b) => (a.distanceMi ?? 0) - (b.distanceMi ?? 0))
-		.map((s) => {
-			const cls = s.isPrimary ? ' class="you"' : '';
-			const dist = s.isPrimary ? 'you' : s.distanceMi !== null ? `${s.distanceMi.toFixed(2)} mi` : '—';
-			return `<tr${cls}><td>${escHtml(dist)}</td><td data-pws-id="${escHtml(s.id)}">${escHtml(s.id)}</td><td>${escHtml(s.rainfall.toFixed(2))}"</td></tr>`;
-		})
-		.join('');
-
-	const comparisonBlock = all.length > 1
+	const comparisonBlock = comparison.count > 1
 		? `<section class="compare">
     <div class="compare-summary">
-      You ranked <strong>${primaryRank}</strong> of <strong>${sorted.length}</strong>${median !== null ? ` · neighborhood median <strong>${escHtml(median.toFixed(2))}"</strong>` : ''}
+      You ranked <strong>${comparison.rank}</strong> of <strong>${comparison.count}</strong>${comparison.median !== null ? ` · neighborhood median <strong>${escHtml(comparison.median.toFixed(2))}"</strong>` : ''}
     </div>
     <table class="compare-table">
       <thead><tr><th>Distance</th><th>Station</th><th>Rain</th></tr></thead>
@@ -3300,34 +3345,14 @@ ${PWS_STORE_SCRIPT}
 
 function renderStationRainCard(e: MultiRainEntry): string {
 	const { stationId, rainfall, neighborRain } = e;
-	const all: Array<{ id: string; distanceMi: number | null; rainfall: number; isPrimary: boolean }> = [];
-	if (rainfall !== null) {
-		all.push({ id: stationId, distanceMi: 0, rainfall, isPrimary: true });
-	}
-	for (const n of neighborRain) {
-		if (n.rainfall !== null) {
-			all.push({ id: n.stationId, distanceMi: n.distanceMi, rainfall: n.rainfall, isPrimary: false });
-		}
-	}
-	const sorted = [...all].sort((a, b) => b.rainfall - a.rainfall);
-	const primaryRank = rainfall !== null ? sorted.findIndex((s) => s.isPrimary) + 1 : 0;
-	const others = sorted.filter((s) => !s.isPrimary).map((s) => s.rainfall);
-	const median = others.length > 0 ? others.slice().sort((a, b) => a - b)[Math.floor(others.length / 2)] : null;
-
-	const rows = [...all]
-		.sort((a, b) => (a.distanceMi ?? 0) - (b.distanceMi ?? 0))
-		.map((s) => {
-			const cls = s.isPrimary ? ' class="you"' : '';
-			const dist = s.isPrimary ? 'you' : s.distanceMi !== null ? `${s.distanceMi.toFixed(2)} mi` : '—';
-			return `<tr${cls}><td>${escHtml(dist)}</td><td data-pws-id="${escHtml(s.id)}">${escHtml(s.id)}</td><td>${escHtml(s.rainfall.toFixed(2))}"</td></tr>`;
-		})
-		.join('');
+	const comparison = compareRainfall(stationId, rainfall, neighborRain);
+	const rows = comparison.byDistance.map(renderStandingRow).join('');
 
 	const answer = rainfall !== null
 		? `<div class="answer">${escHtml(rainfall.toFixed(2))}"</div><div class="unit">inches</div>`
 		: `<div class="none">No data</div>`;
-	const summary = all.length > 1
-		? `<div class="summary">Ranked <strong>${primaryRank}</strong> of <strong>${sorted.length}</strong>${median !== null ? ` · median <strong>${escHtml(median.toFixed(2))}"</strong>` : ''}</div>`
+	const summary = comparison.count > 1
+		? `<div class="summary">Ranked <strong>${comparison.rank}</strong> of <strong>${comparison.count}</strong>${comparison.median !== null ? ` · median <strong>${escHtml(comparison.median.toFixed(2))}"</strong>` : ''}</div>`
 		: '';
 
 	return `<div class="station-card">

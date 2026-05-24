@@ -39,6 +39,16 @@ _Avoid_: history chunk, backfill block.
 A station's current / 24h / 7d rollup of rain, temp, and wind, derived by `computeSpanStats`.
 _Avoid_: summary stats.
 
+### Comparison
+
+**Rainfall comparison**:
+A ranking of a **Primary station** against its **Neighbor station**s by rainfall for one date — yields the rank, the count, the neighbourhood median (a true median of the neighbours, primary excluded), and the standings shown on the rain pages. Produced by `compareRainfall`.
+_Avoid_: leaderboard, ranking.
+
+**Standing**:
+One station's entry in a **Rainfall comparison** — its id, distance, rainfall, and whether it is the primary.
+_Avoid_: row, entry.
+
 ### Storage & seams
 
 **Station cache**:
