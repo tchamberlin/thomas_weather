@@ -184,7 +184,7 @@ interface BackfillState {
 	};
 }
 
-interface DashboardData {
+export interface DashboardData {
 	stationId: string;
 	today: DailyWeather | null;
 	recentDays: DailyWeather[];
@@ -192,6 +192,11 @@ interface DashboardData {
 	historyIndex: HistoryIndex | null;
 	current: WUCurrentObservation | null;
 	lastReading: string;
+	// When the cron last *successfully wrote* this station's current cache (from
+	// the KV value's `cachedAt` metadata). This is ground truth for "is the
+	// pipeline alive", unlike lastScheduledRun which is just the computed cron
+	// clock and stays "fresh" even when every write is failing.
+	lastWriteAt: string | null;
 	lastScheduledRun: string | null;
 	nextScheduledRun: string | null;
 	dataSource: string;
@@ -455,6 +460,7 @@ async function buildDashboard(env: Env, stationId: string): Promise<DashboardDat
 		hourly7Day,
 		current,
 		lastReading,
+		lastWriteAt: currentResult.lastWriteAt,
 		lastScheduledRun,
 		nextScheduledRun,
 		dataSource: dailyResult.source,
@@ -463,10 +469,22 @@ async function buildDashboard(env: Env, stationId: string): Promise<DashboardDat
 	};
 }
 
-async function loadCurrent(env: Env, stationId: string): Promise<{ current: WUCurrentObservation | null; warning: string | null }> {
-	const current = await readCachedCurrent(env, stationId);
-	if (current) return { current, warning: null };
-	return { current: null, warning: 'Current conditions unavailable (not yet cached by the scheduled refresh).' };
+async function loadCurrent(
+	env: Env,
+	stationId: string,
+): Promise<{ current: WUCurrentObservation | null; lastWriteAt: string | null; warning: string | null }> {
+	if (!env.WEATHER) return { current: null, lastWriteAt: null, warning: 'Current conditions unavailable (no KV).' };
+	// One read fetches both the value and the cron's `cachedAt` write stamp.
+	const { value, metadata } = await env.WEATHER.getWithMetadata<{ cachedAt?: string }>(currentCacheKey(stationId));
+	const lastWriteAt = typeof metadata?.cachedAt === 'string' ? metadata.cachedAt : null;
+	if (!value) {
+		return { current: null, lastWriteAt, warning: 'Current conditions unavailable (not yet cached by the scheduled refresh).' };
+	}
+	try {
+		return { current: JSON.parse(value) as WUCurrentObservation, lastWriteAt, warning: null };
+	} catch {
+		return { current: null, lastWriteAt, warning: 'Current conditions unavailable (not yet cached by the scheduled refresh).' };
+	}
 }
 
 const CURRENT_PREFIX = 'weather:current:v1';
@@ -735,7 +753,6 @@ interface StationCoords {
 }
 
 const COORDS_KV_PREFIX = 'station:coords:v1';
-const COORDS_TTL_SECONDS = 60 * 60 * 24 * 30;
 
 type StationLatLon = Omit<StationCoords, 'stats'>;
 
@@ -758,15 +775,23 @@ async function getStationCoords(env: Env, stationId: string): Promise<StationLat
 	return null;
 }
 
-/** KV write only — derives coords from the cron's already-fetched observation. */
+/**
+ * KV write only — derives coords from the cron's already-fetched observation.
+ *
+ * Coords are effectively static, but this ran every cron tick for every station
+ * (no dedup, TTL-only), which alone burned ~1 write/station/tick — the single
+ * biggest contributor to blowing the daily KV write budget. We now dedup on
+ * payload like the other caches and drop the TTL: a station's lat/lon never
+ * changes, so re-writing it (and letting it expire) is pure waste.
+ */
 async function cacheStationCoords(env: Env, stationId: string, current: WUCurrentObservation): Promise<void> {
 	if (!env.WEATHER) return;
 	if (typeof current.lat !== 'number' || typeof current.lon !== 'number') return;
-	await env.WEATHER.put(
-		coordsCacheKey(stationId),
-		JSON.stringify({ lat: current.lat, lon: current.lon }),
-		{ expirationTtl: COORDS_TTL_SECONDS },
-	);
+	const key = coordsCacheKey(stationId);
+	const payload = JSON.stringify({ lat: current.lat, lon: current.lon });
+	if (WRITE_DEDUP_CACHE.get(key) === payload) return;
+	await env.WEATHER.put(key, payload);
+	WRITE_DEDUP_CACHE.set(key, payload);
 }
 
 function meanOrNull(vals: Array<number | null>): number | null {
@@ -774,22 +799,47 @@ function meanOrNull(vals: Array<number | null>): number | null {
 	return nums.length > 0 ? nums.reduce((a, b) => a + b, 0) / nums.length : null;
 }
 
-// Hourly precipTotal is a per-day running counter; sum the rises (and treat a
-// drop as a day rollover) to get accumulation across the window. Slightly
-// under-counts because rain before the first sample isn't known.
-function sumPrecipDeltas(obs: WUHistoryObservation[]): number | null {
-	const sorted = [...obs].sort((a, b) => (a.epoch ?? 0) - (b.epoch ?? 0));
-	let total = 0;
-	let prev: number | null = null;
-	let any = false;
-	for (const o of sorted) {
-		const pt = numberOrNull(o.imperial?.precipTotal);
-		if (pt === null) continue;
-		any = true;
-		if (prev !== null) total += pt >= prev ? pt - prev : pt;
-		prev = pt;
+// Rainfall over a recent window from hourly observations.
+//
+// WU's hourly `precipTotal` is a per-LOCAL-DAY running counter, but it is NOT
+// monotonic — QC corrections nudge it back down within the day (you'll see it
+// drift down even while precipRate is 0). The previous implementation summed
+// deltas and treated every downward step as a midnight rollover, re-adding the
+// full counter each time; on a single rainy day that inflated the 24h figure to
+// several times the real total (famously making "24h" exceed "7d").
+//
+// Instead we never infer rollovers from value drops: we bucket by obsTimeLocal
+// date and take each date's max (its daily total). The window's oldest date is
+// only partially covered, so we subtract the counter value at the window's
+// start. Each date thus contributes <= its daily-summary total, which keeps this
+// consistent with the 7-day sum and guarantees 24h <= 7d.
+export function sumPrecipDeltas(obs: WUHistoryObservation[]): number | null {
+	const points = obs
+		.map((o) => ({
+			date: o.obsTimeLocal ? localDate(o.obsTimeLocal) : null,
+			pt: numberOrNull(o.imperial?.precipTotal),
+			t: obsTimeMs(o),
+		}))
+		.filter((p): p is { date: string; pt: number; t: number } => p.date !== null && p.pt !== null && Number.isFinite(p.t))
+		.sort((a, b) => a.t - b.t);
+	if (points.length === 0) return null;
+
+	const byDate = new Map<string, { first: number; max: number }>();
+	for (const p of points) {
+		const cur = byDate.get(p.date);
+		if (!cur) byDate.set(p.date, { first: p.pt, max: p.pt });
+		else cur.max = Math.max(cur.max, p.pt);
 	}
-	return any ? total : null;
+
+	const dates = [...byDate.keys()].sort();
+	let total = 0;
+	dates.forEach((date, i) => {
+		const { first, max } = byDate.get(date)!;
+		// Oldest date is the partial boundary — count only what fell after the
+		// window opened. Later dates sit fully inside the window.
+		total += i === 0 ? Math.max(0, max - first) : max;
+	});
+	return total;
 }
 
 function obsTimeMs(o: WUHistoryObservation): number {
@@ -800,15 +850,16 @@ function obsTimeMs(o: WUHistoryObservation): number {
 	return typeof o.epoch === 'number' ? o.epoch * 1000 : NaN;
 }
 
-// Pure derivation over already-cached KV data — no WU access, no dedicated KV
-// key. `current`, `hourly`, and `days` all come from caches the cron populates.
-async function getStationSpanStats(env: Env, stationId: string): Promise<StationSpanStats> {
+// Pure derivation of the current / 24h / 7d span stats. Separated from KV IO so
+// the rainfall invariants below can be exhaustively tested (see
+// test/span-stats-invariants.test.ts). `nowMs` is injected for determinism.
+export function computeSpanStats(
+	current: WUCurrentObservation | null,
+	hourly: WUHistoryObservation[],
+	days: DailyWeather[],
+	nowMs: number,
+): StationSpanStats {
 	const empty = (): SpanStats => ({ rain: null, tempAvg: null, windAvg: null });
-	const [current, hourly, days] = await Promise.all([
-		readCachedCurrent(env, stationId),
-		loadHourly7Day(env, stationId),
-		loadDailySummaries(env, stationId).then((r) => r.days),
-	]);
 
 	const cur = empty();
 	if (current?.imperial) {
@@ -818,7 +869,7 @@ async function getStationSpanStats(env: Env, stationId: string): Promise<Station
 	}
 
 	const day = empty();
-	const cutoffMs = Date.now() - 24 * 3600 * 1000;
+	const cutoffMs = nowMs - 24 * 3600 * 1000;
 	const recent = hourly.filter((o) => {
 		const t = obsTimeMs(o);
 		return Number.isFinite(t) && t >= cutoffMs;
@@ -837,13 +888,35 @@ async function getStationSpanStats(env: Env, stationId: string): Promise<Station
 		week.windAvg = meanOrNull(days.map((d) => d.windAvg));
 	}
 
-	console.log(
-		`[spanstats] ${stationId} hourly=${hourly.length} recent24h=${recent.length} ` +
-		`current={t:${cur.tempAvg},w:${cur.windAvg},r:${cur.rain}} ` +
-		`day={t:${day.tempAvg},w:${day.windAvg},r:${day.rain}} week={t:${week.tempAvg},w:${week.windAvg},r:${week.rain}}`,
-	);
+	// INVARIANT (enforced + tested): rain over the last 24h can never exceed rain
+	// over the last 7d. The two come from different WU endpoints (hourly vs daily
+	// summary), so a source disagreement could in principle violate it. Clamping
+	// the 24h figure to the 7d total — a hard upper bound on any sub-window — can
+	// only ever tighten an over-count, never fabricate rain. So we can guarantee
+	// the user is never shown 24h > 7d.
+	if (day.rain !== null && week.rain !== null && day.rain > week.rain) {
+		day.rain = week.rain;
+	}
 
 	return { current: cur, day, week };
+}
+
+// Thin IO wrapper: loads the caches the cron populates (no WU access), then
+// defers all arithmetic to the pure computeSpanStats above.
+async function getStationSpanStats(env: Env, stationId: string): Promise<StationSpanStats> {
+	const [current, hourly, days] = await Promise.all([
+		readCachedCurrent(env, stationId),
+		loadHourly7Day(env, stationId),
+		loadDailySummaries(env, stationId).then((r) => r.days),
+	]);
+	const stats = computeSpanStats(current, hourly, days, Date.now());
+	console.log(
+		`[spanstats] ${stationId} hourly=${hourly.length} ` +
+		`current={t:${stats.current.tempAvg},w:${stats.current.windAvg},r:${stats.current.rain}} ` +
+		`day={t:${stats.day.tempAvg},w:${stats.day.windAvg},r:${stats.day.rain}} ` +
+		`week={t:${stats.week.tempAvg},w:${stats.week.windAvg},r:${stats.week.rain}}`,
+	);
+	return stats;
 }
 
 async function getStationCoordsList(env: Env, stationIds: string[]): Promise<StationCoords[]> {
@@ -1577,7 +1650,33 @@ function jsonResponse(value: unknown, status = 200): Response {
 	});
 }
 
-function renderDashboard(d: DashboardData, includeLiveReload: boolean): string {
+// Data is considered stale after more than two cron ticks (15m each) without a
+// successful write. One number, used by both the staleness verdict and the test
+// that proves the UI can't hide staleness.
+export const STALE_AFTER_MINUTES = 35;
+
+export interface Freshness {
+	/** Minutes since the cron last successfully wrote this station (null = never). */
+	writeAgeMinutes: number | null;
+	/** True when the shown data must be flagged stale. */
+	stale: boolean;
+}
+
+/**
+ * THE single source of truth for "is the data the dashboard is about to show
+ * stale?". `renderDashboard` derives its staleness banner from exactly this, and
+ * test/freshness-honesty.test.ts asserts the biconditional `stale <=> banner
+ * present` across the full range of write ages — so showing stale data without
+ * the indicator (or crying wolf when fresh) is a test failure.
+ */
+export function evaluateFreshness(lastWriteAt: string | null, nowMs: number): Freshness {
+	const writeMs = lastWriteAt ? Date.parse(lastWriteAt) : null;
+	const writeAgeMinutes =
+		writeMs !== null && Number.isFinite(writeMs) ? Math.max(0, Math.floor((nowMs - writeMs) / 60_000)) : null;
+	return { writeAgeMinutes, stale: writeAgeMinutes === null || writeAgeMinutes > STALE_AFTER_MINUTES };
+}
+
+export function renderDashboard(d: DashboardData, includeLiveReload: boolean, nowMs: number = Date.now()): string {
 	const current = d.current?.imperial;
 	const hourlyChartPayload = buildHourlyChartPayload(d.hourly7Day);
 	const metrics = [
@@ -1611,8 +1710,12 @@ function renderDashboard(d: DashboardData, includeLiveReload: boolean): string {
 	const liveReloadScript = includeLiveReload ? renderLiveReloadScript() : '';
 	const currentFreshness = fmtCurrentFreshness(d.current);
 	const staleMs = d.current?.obsTimeUtc ? Date.parse(d.current.obsTimeUtc) : null;
-	const pwsAge = staleMs && Number.isFinite(staleMs) ? Math.max(0, Math.floor((Date.now() - staleMs) / 60_000)) : null;
-	const refreshAge = d.lastScheduledRun ? Math.max(0, Math.floor((Date.now() - Date.parse(d.lastScheduledRun)) / 60_000)) : null;
+	const pwsAge = staleMs && Number.isFinite(staleMs) ? Math.max(0, Math.floor((nowMs - staleMs) / 60_000)) : null;
+	// Freshness from the actual last successful write, not the cron clock. If the
+	// cron is running but its KV writes are failing (e.g. the daily write limit),
+	// lastScheduledRun still ticks forward while lastWriteAt goes stale — so this
+	// is what we trust and surface. Single chokepoint: evaluateFreshness.
+	const { writeAgeMinutes: dataAge, stale: dataStale } = evaluateFreshness(d.lastWriteAt, nowMs);
 	const scheduleCountdown = d.nextScheduledRun
 		? `<span id="schedule-countdown" data-next-run="${Date.parse(d.nextScheduledRun)}">--:--</span>`
 		: '';
@@ -1891,6 +1994,12 @@ function renderDashboard(d: DashboardData, includeLiveReload: boolean): string {
     color: #7a5a00;
     font-size: .86rem;
   }
+  .notice-error {
+    border-color: #e2a3a3;
+    background: #fdeaea;
+    color: #8a1f1f;
+    font-weight: 600;
+  }
   .footer {
     margin-top: 14px;
     line-height: 1.6;
@@ -1920,12 +2029,26 @@ function renderDashboard(d: DashboardData, includeLiveReload: boolean): string {
     </div>
     <div class="meta">
       PWS → WU: ${escHtml(d.lastReading)}${pwsAge !== null ? ` (${fmtDuration(pwsAge)} ago)` : ''}<br>
-      Last worker refresh: ${d.lastScheduledRun ? escHtml(d.lastScheduledRun.slice(11, 16)) + ' UTC' + (refreshAge !== null ? ` (${fmtDuration(refreshAge)} ago)` : '') : 'N/A'}<br>
+      Last data update: ${
+				d.lastWriteAt
+					? escHtml(d.lastWriteAt.slice(11, 16)) +
+						' UTC' +
+						(dataAge !== null ? ` (${fmtDuration(dataAge)} ago)` : '') +
+						(dataStale ? ' ⚠' : '')
+					: 'never'
+			}<br>
       Reading stale: ${staleMs && Number.isFinite(staleMs) ? `<span id="stale-timer" data-stale-ms="${staleMs}">--:--</span>` : 'N/A'}<br>
-      Next fetch: ${scheduleCountdown || 'N/A'}
+      Next fetch: ${scheduleCountdown || 'N/A'} (scheduled)
     </div>
   </header>
 
+  ${
+		dataStale
+			? `<div class="notice notice-error" data-testid="stale-banner">Data hasn't refreshed ${
+					dataAge !== null ? `in ${fmtDuration(dataAge)}` : 'yet'
+				}. The scheduled worker may be running but failing to write (e.g. the daily KV write limit). Showing the last values that landed in KV.</div>`
+			: ''
+	}
   ${d.warning ? `<div class="notice">${escHtml(d.warning)}</div>` : ''}
 
   <section class="chart-shell">
