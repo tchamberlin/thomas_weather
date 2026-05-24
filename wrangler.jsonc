@@ -33,8 +33,10 @@
 	],
 	"vars": {
 		// How often the cron refreshes neighbor stations, in 15-minute cron ticks
-		// (4 => hourly). Primary stations refresh every tick.
-		"NEIGHBOR_REFRESH_EVERY_N_TICKS": "4"
+		// (24 => every 6 hours). Primaries refresh `current` every tick; their
+		// daily-summary + history refresh hourly (see PRIMARY_FULL_EVERY_N_TICKS).
+		// Tuned down to keep total WU API calls under the PWS free-tier quota.
+		"NEIGHBOR_REFRESH_EVERY_N_TICKS": "24"
 	}
 	/**
    * Secrets (set via `npx wrangler secret put <NAME>`):

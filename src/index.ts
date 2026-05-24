@@ -42,12 +42,30 @@ interface NeighborsFile {
 const NEIGHBORS_KV_KEY = 'weather:config:neighbors';
 const EMPTY_NEIGHBORS: NeighborsFile = { generatedAt: '', stations: {} };
 
+// Refresh and display only the nearest few neighbors per primary. The stored
+// config over-collects (discover-neighbors found 40+), and every extra neighbor
+// is ~3 WU calls per refresh. Capping here — at the single read-point all
+// consumers (cron refresh set, rain pages) go through — bounds WU volume no
+// matter what's in KV.
+export const MAX_NEIGHBORS_PER_STATION = 3;
+
+export function nearestNeighbors(entries: NeighborEntry[]): NeighborEntry[] {
+	return [...entries]
+		.sort((a, b) => (a.distanceMi ?? Number.POSITIVE_INFINITY) - (b.distanceMi ?? Number.POSITIVE_INFINITY))
+		.slice(0, MAX_NEIGHBORS_PER_STATION);
+}
+
 async function getNeighbors(env: Env): Promise<NeighborsFile> {
 	const raw = await env.WEATHER.get(NEIGHBORS_KV_KEY);
 	if (!raw) return EMPTY_NEIGHBORS;
 	try {
 		const parsed = JSON.parse(raw) as NeighborsFile;
-		if (parsed && typeof parsed === 'object' && parsed.stations) return parsed;
+		if (parsed && typeof parsed === 'object' && parsed.stations) {
+			for (const entry of Object.values(parsed.stations)) {
+				entry.neighbors = nearestNeighbors(entry.neighbors ?? []);
+			}
+			return parsed;
+		}
 	} catch {}
 	return EMPTY_NEIGHBORS;
 }
@@ -208,6 +226,11 @@ const CACHE_PREFIX = 'weather:dailySummaries:v1';
 const HISTORY_PREFIX = 'weather:history:hourly:raw';
 const HISTORY_BLOCK_DAYS = 31;
 
+// Primaries fetch `current` every cron tick, but the slower-moving daily-summary
+// and hourly-history only every Nth tick (4 => hourly). Cuts primary WU calls ~3x
+// without making today's headline rainfall (driven by `current`) any staler.
+const PRIMARY_FULL_EVERY_N_TICKS = 4;
+
 // In-isolate dedup: skip KV PUTs when payload bytes match the last value we wrote.
 // Isolate restarts will re-PUT once; that's acceptable.
 const WRITE_DEDUP_CACHE = new Map<string, string>();
@@ -227,18 +250,21 @@ export default {
 		const tickIndex = Math.floor(event.scheduledTime / (15 * 60 * 1000));
 		const neighborEveryN = neighborRefreshEveryNTicks(env);
 		const refreshNeighbors = tickIndex % neighborEveryN === 0;
+		// Primaries get the full refresh (current + daily + history) only on the
+		// hourly tick; every other tick refreshes just `current`.
+		const primaryFull = tickIndex % PRIMARY_FULL_EVERY_N_TICKS === 0;
 
 		const primaryIds = await getStationIds(env);
-		console.log(`[cron] refreshing ${primaryIds.length} primary stations (tick ${tickIndex})`);
+		console.log(`[cron] refreshing ${primaryIds.length} primary stations (tick ${tickIndex}, full=${primaryFull})`);
 		for (const stationId of primaryIds) {
-			await refreshStation(wu, env, stationId);
+			await refreshStation(wu, env, stationId, { full: primaryFull });
 		}
 
 		if (refreshNeighbors) {
 			const neighborIds = await getNeighborStationIds(env);
 			console.log(`[cron] refreshing ${neighborIds.length} neighbor stations (tick ${tickIndex}, every ${neighborEveryN})`);
 			for (const stationId of neighborIds) {
-				await refreshStation(wu, env, stationId);
+				await refreshStation(wu, env, stationId, { full: true });
 			}
 		} else {
 			console.log(`[cron] skipping neighbor refresh (tick ${tickIndex}, cadence every ${neighborEveryN})`);
@@ -1100,11 +1126,15 @@ async function refreshRecentHistory(wu: WuClient, env: Env, stationId: string): 
 	}
 }
 
-// Refreshes every KV cache the request path reads for one station. A single
-// `fetchCurrent` feeds both the current-conditions cache and the coords cache.
-// Per-station errors are logged and swallowed so one bad station can't abort
-// the rest of the cron run.
-async function refreshStation(wu: WuClient, env: Env, stationId: string): Promise<void> {
+// Refreshes the KV caches the request path reads for one station. `current` is
+// fetched on every call (cheap, changes every tick, and keeps today's headline
+// rainfall + the staleness clock fresh); the heavier daily-summary and hourly-
+// history fetches run only when `full` is set, so primaries can poll `current`
+// every 15m while the slower data refreshes hourly — keeping WU calls under the
+// PWS API quota. A single `fetchCurrent` feeds both the current and coords
+// caches. Per-station errors are logged and swallowed so one bad station can't
+// abort the rest of the cron run.
+async function refreshStation(wu: WuClient, env: Env, stationId: string, opts: { full: boolean }): Promise<void> {
 	try {
 		const current = await fetchCurrent(wu, stationId).catch((err) => {
 			console.warn(`[cron] ${stationId} current fetch failed: ${errMsg(err)}`);
@@ -1114,8 +1144,10 @@ async function refreshStation(wu: WuClient, env: Env, stationId: string): Promis
 			await cacheCurrent(env, stationId, current);
 			await cacheStationCoords(env, stationId, current);
 		}
-		await refreshDailySummaryCache(wu, env, stationId);
-		await refreshRecentHistory(wu, env, stationId);
+		if (opts.full) {
+			await refreshDailySummaryCache(wu, env, stationId);
+			await refreshRecentHistory(wu, env, stationId);
+		}
 	} catch (err: unknown) {
 		console.error(`[cron] ${stationId} refresh failed: ${errMsg(err)}`);
 	}
